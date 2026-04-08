@@ -129,6 +129,48 @@ def _prepare_table(
     return frame
 
 
+def _attach_latest_quotes(
+    frame: pd.DataFrame,
+    *,
+    default_market: str | None = None,
+    ticker_column: str = "ticker",
+    market_column: str = "market",
+) -> pd.DataFrame:
+    if frame.empty or ticker_column not in frame.columns:
+        return frame
+
+    enriched = frame.copy()
+    current_prices: list[float | None] = []
+    change_pcts: list[float | None] = []
+    quote_as_ofs: list[str] = []
+
+    for _, row in enriched.iterrows():
+        quote = get_latest_quote(str(row.get(ticker_column, "")))
+        current_price = pd.to_numeric(quote.get("current_price", None), errors="coerce")
+        change_pct = pd.to_numeric(quote.get("change_pct", None), errors="coerce")
+        market = default_market
+        if market_column in enriched.columns:
+            market = str(row.get(market_column, default_market or "")).upper()
+
+        current_prices.append(None if pd.isna(current_price) else float(current_price))
+        change_pcts.append(None if pd.isna(change_pct) else float(change_pct))
+        quote_as_ofs.append(str(quote.get("as_of", "")))
+
+        if "current_price" not in enriched.columns or pd.isna(pd.to_numeric(row.get("current_price", None), errors="coerce")):
+            continue
+
+        existing_price = pd.to_numeric(row.get("current_price", None), errors="coerce")
+        if not pd.isna(existing_price) and not pd.isna(current_price):
+            current_prices[-1] = float(current_price)
+        elif not pd.isna(existing_price):
+            current_prices[-1] = float(existing_price)
+
+    enriched["current_price"] = current_prices
+    enriched["change_pct"] = change_pcts
+    enriched["quote_as_of"] = quote_as_ofs
+    return enriched
+
+
 def _show_table(
     df: pd.DataFrame,
     *,
@@ -167,9 +209,11 @@ def _candidate_column_config() -> dict[str, object]:
         "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
         "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
         "current_price": st.column_config.TextColumn("현재가", width="small"),
+        "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
         "target_1": st.column_config.TextColumn("1차목표", width="small"),
+        "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
         "regime": st.column_config.TextColumn("장세", width="small"),
         "regime_delta": st.column_config.NumberColumn("장세보정", format="%d", width="small"),
         "learning_delta": st.column_config.NumberColumn("학습보정", format="%d", width="small"),
@@ -292,10 +336,13 @@ def _trade_column_config() -> dict[str, object]:
         "score_band": st.column_config.TextColumn("등급", width="small"),
         "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
         "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
+        "current_price": st.column_config.TextColumn("현재가", width="small"),
+        "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
         "target_1": st.column_config.TextColumn("1차목표", width="small"),
         "target_2": st.column_config.TextColumn("2차목표", width="small"),
+        "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
         "regime": st.column_config.TextColumn("장세", width="small"),
         "regime_delta": st.column_config.NumberColumn("장세보정", format="%d", width="small"),
         "learning_delta": st.column_config.NumberColumn("학습보정", format="%d", width="small"),
@@ -537,6 +584,37 @@ def _enrich_recommendation_frame(
         return frame.copy()
 
     enriched = frame.copy()
+    defaults: dict[str, object] = {
+        "setup": "",
+        "action": "",
+        "current_price": None,
+        "change_pct": None,
+        "quote_as_of": "",
+        "entry_price": None,
+        "stop_loss": None,
+        "target_1": None,
+        "target_2": None,
+        "regime": "",
+        "regime_delta": 0,
+        "learning_delta": 0,
+        "trend_score": 0,
+        "momentum_score": 0,
+        "volume_score": 0,
+        "breakout_score": 0,
+        "volume_ratio": None,
+        "return_20d": None,
+        "short_return_pct": None,
+        "above_vwap": None,
+        "rs_score": None,
+        "atr_pct": None,
+        "from_52w_high_pct": None,
+        "risk_level": "",
+        "risk_reward_1": None,
+        "exit_rule": "",
+    }
+    for column, default_value in defaults.items():
+        if column not in enriched.columns:
+            enriched[column] = default_value
     enriched["score_band"] = enriched["score"].apply(lambda value: _score_band(float(value)))
     enriched["score_view"] = enriched["score"].apply(lambda value: _score_view(float(value)))
 
@@ -885,6 +963,7 @@ def render_portfolio_analysis() -> None:
 
     rows: list[dict[str, object]] = []
     for row in st.session_state.portfolio.to_dict("records"):
+        market = str(row.get("market", "")).strip().upper()
         ticker = str(row.get("ticker", "")).strip().upper()
         if not ticker:
             continue
@@ -893,12 +972,15 @@ def render_portfolio_analysis() -> None:
         if data.empty:
             rows.append(
                 {
+                    "market": market,
                     "ticker": ticker,
                     "name": row.get("name", ""),
                     "action": "데이터 없음",
                     "score": None,
                     "current_price": None,
+                    "change_pct": None,
                     "return_pct": None,
+                    "quote_as_of": "",
                     "reason": "가격 데이터를 불러오지 못했습니다.",
                 }
             )
@@ -914,17 +996,25 @@ def render_portfolio_analysis() -> None:
                 target_weight=float(row.get("target_weight", 0) or 0),
             ),
         )
+        quote = get_latest_quote(ticker)
+        live_price = pd.to_numeric(quote.get("current_price", None), errors="coerce")
+        current_price = float(live_price) if not pd.isna(live_price) else float(result.current_price)
+        avg_price = float(row.get("avg_price", 0) or 0)
+        return_pct = ((current_price - avg_price) / avg_price * 100) if avg_price > 0 else None
 
         rows.append(
             {
+                "market": market,
                 "ticker": ticker,
                 "name": row.get("name", ""),
                 "action": result.action,
                 "score": result.score,
-                "current_price": round(result.current_price, 2),
-                "return_pct": round(result.return_pct, 2),
+                "current_price": round(current_price, 2),
+                "change_pct": pd.to_numeric(quote.get("change_pct", None), errors="coerce"),
+                "return_pct": round(return_pct, 2) if return_pct is not None else None,
                 "buy_pct": result.suggested_buy_pct,
                 "sell_pct": result.suggested_sell_pct,
+                "quote_as_of": str(quote.get("as_of", "")),
                 "reason": " / ".join(result.reasons),
             }
         )
@@ -934,7 +1024,40 @@ def render_portfolio_analysis() -> None:
         return
 
     summary = pd.DataFrame(rows)
-    st.dataframe(summary, use_container_width=True)
+    _show_table(
+        summary[
+            [
+                "market",
+                "ticker",
+                "name",
+                "action",
+                "score",
+                "current_price",
+                "change_pct",
+                "return_pct",
+                "buy_pct",
+                "sell_pct",
+                "quote_as_of",
+                "reason",
+            ]
+        ],
+        datetime_columns=["quote_as_of"],
+        currency_columns=["current_price"],
+        column_config={
+            "market": st.column_config.TextColumn("시장", width="small"),
+            "ticker": st.column_config.TextColumn("티커", width="small"),
+            "name": st.column_config.TextColumn("종목명", width="small"),
+            "action": st.column_config.TextColumn("현재 판단", width="small"),
+            "score": st.column_config.NumberColumn("점수", format="%d", width="small"),
+            "current_price": st.column_config.TextColumn("현재가", width="small"),
+            "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
+            "return_pct": st.column_config.NumberColumn("현재수익률", format="%.2f", width="small"),
+            "buy_pct": st.column_config.NumberColumn("추가매수%", format="%d", width="small"),
+            "sell_pct": st.column_config.NumberColumn("축소%", format="%d", width="small"),
+            "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
+            "reason": st.column_config.TextColumn("핵심 사유", width="large"),
+        },
+    )
 
 
 def render_rebalance_hint() -> None:
@@ -1049,12 +1172,15 @@ def render_portfolio_insights() -> None:
         st.dataframe(correlation, use_container_width=True)
 
     st.markdown("#### 보유 종목 상세 스타일")
-    st.dataframe(
-        analysis[
+    analysis_view = _attach_latest_quotes(analysis, market_column="market")
+    _show_table(
+        analysis_view[
             [
                 "market",
                 "ticker",
                 "name",
+                "current_price",
+                "change_pct",
                 "weight_pct",
                 "pnl_pct",
                 "volatility_pct",
@@ -1065,10 +1191,29 @@ def render_portfolio_insights() -> None:
                 "risk_level",
                 "style",
                 "sector",
+                "quote_as_of",
             ]
         ],
-        use_container_width=True,
-        hide_index=True,
+        datetime_columns=["quote_as_of"],
+        currency_columns=["current_price"],
+        column_config={
+            "market": st.column_config.TextColumn("시장", width="small"),
+            "ticker": st.column_config.TextColumn("티커", width="small"),
+            "name": st.column_config.TextColumn("종목명", width="small"),
+            "current_price": st.column_config.TextColumn("현재가", width="small"),
+            "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
+            "weight_pct": st.column_config.NumberColumn("비중", format="%.2f", width="small"),
+            "pnl_pct": st.column_config.NumberColumn("손익%", format="%.2f", width="small"),
+            "volatility_pct": st.column_config.NumberColumn("변동성", format="%.2f", width="small"),
+            "drawdown_pct": st.column_config.NumberColumn("낙폭", format="%.2f", width="small"),
+            "return_6m_pct": st.column_config.NumberColumn("6개월", format="%.2f", width="small"),
+            "return_1y_pct": st.column_config.NumberColumn("1년", format="%.2f", width="small"),
+            "dividend_yield_pct": st.column_config.NumberColumn("배당수익률", format="%.2f", width="small"),
+            "risk_level": st.column_config.TextColumn("위험도", width="small"),
+            "style": st.column_config.TextColumn("스타일", width="small"),
+            "sector": st.column_config.TextColumn("섹터", width="small"),
+            "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
+        },
     )
 
 
@@ -1086,6 +1231,8 @@ def render_market_scanner() -> None:
     kr_scan = scan_market("KR", st.session_state.watchlists["KR"], min_score=min_score, learning_adjustments=learning_adjustments)
     us_scan = _enrich_recommendation_frame(us_scan, scan_type="today_scan", market="US", pattern_lookup=pattern_lookup)
     kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="today_scan", market="KR", pattern_lookup=pattern_lookup)
+    us_scan = _attach_latest_quotes(us_scan, default_market="US")
+    kr_scan = _attach_latest_quotes(kr_scan, default_market="KR")
 
     us_tab, kr_tab = st.tabs(["미국", "한국"])
     with us_tab:
@@ -1104,6 +1251,9 @@ def render_market_scanner() -> None:
                     "recent_hit_rate_20d",
                     "recent_target_rate_5d",
                     "score",
+                    "current_price",
+                    "change_pct",
+                    "quote_as_of",
                     "regime",
                     "regime_delta",
                     "learning_delta",
@@ -1122,7 +1272,8 @@ def render_market_scanner() -> None:
             ]
             _show_table(
                 us_view,
-                currency_columns=["entry_price", "stop_loss", "target_1"],
+                datetime_columns=["quote_as_of"],
+                currency_columns=["current_price", "entry_price", "stop_loss", "target_1"],
                 default_market="US",
                 column_config=_candidate_column_config(),
             )
@@ -1144,6 +1295,9 @@ def render_market_scanner() -> None:
                     "recent_hit_rate_20d",
                     "recent_target_rate_5d",
                     "score",
+                    "current_price",
+                    "change_pct",
+                    "quote_as_of",
                     "regime",
                     "regime_delta",
                     "learning_delta",
@@ -1162,7 +1316,8 @@ def render_market_scanner() -> None:
             ]
             _show_table(
                 kr_view,
-                currency_columns=["entry_price", "stop_loss", "target_1"],
+                datetime_columns=["quote_as_of"],
+                currency_columns=["current_price", "entry_price", "stop_loss", "target_1"],
                 default_market="KR",
                 column_config=_candidate_column_config(),
             )
@@ -1198,6 +1353,8 @@ def render_buy_now_panel() -> None:
     kr_scan = scan_market("KR", st.session_state.watchlists["KR"], min_score=min_score, learning_adjustments=learning_adjustments)
     us_scan = _enrich_recommendation_frame(us_scan, scan_type="today_scan", market="US", pattern_lookup=pattern_lookup)
     kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="today_scan", market="KR", pattern_lookup=pattern_lookup)
+    us_scan = _attach_latest_quotes(us_scan, default_market="US")
+    kr_scan = _attach_latest_quotes(kr_scan, default_market="KR")
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
 
     if combined.empty:
@@ -1223,6 +1380,9 @@ def render_buy_now_panel() -> None:
                 "recent_hit_rate_20d",
                 "recent_target_rate_5d",
                 "score",
+                "current_price",
+                "change_pct",
+                "quote_as_of",
                 "regime",
                 "regime_delta",
                 "learning_delta",
@@ -1237,7 +1397,8 @@ def render_buy_now_panel() -> None:
                 "reason",
             ]
         ],
-        currency_columns=["entry_price", "stop_loss", "target_1"],
+        datetime_columns=["quote_as_of"],
+        currency_columns=["current_price", "entry_price", "stop_loss", "target_1"],
         column_config=_candidate_column_config(),
     )
     _render_manual_tracking_quick_add(top, source_label="오늘바로볼종목", key_prefix="buy_now_top")
@@ -1258,6 +1419,9 @@ def render_buy_now_panel() -> None:
                 "score_band",
                 "recent_hit_rate_20d",
                 "recent_target_rate_5d",
+                "current_price",
+                "change_pct",
+                "quote_as_of",
                 "regime",
                 "regime_delta",
                 "learning_delta",
@@ -1272,7 +1436,8 @@ def render_buy_now_panel() -> None:
                 "score",
             ]
         ],
-        currency_columns=["entry_price", "stop_loss"],
+        datetime_columns=["quote_as_of"],
+        currency_columns=["current_price", "entry_price", "stop_loss"],
         column_config=_candidate_column_config(),
     )
     _render_manual_tracking_quick_add(momentum_board, source_label="급등후보보드", key_prefix="momentum_board")
@@ -1313,6 +1478,9 @@ def render_buy_now_panel() -> None:
                             "name",
                             "setup",
                             "score",
+                            "current_price",
+                            "change_pct",
+                            "quote_as_of",
                             "regime",
                             "regime_delta",
                             "learning_delta",
@@ -1323,7 +1491,8 @@ def render_buy_now_panel() -> None:
                             "reason",
                         ]
                     ],
-                    currency_columns=["entry_price", "stop_loss"],
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss"],
                     column_config=_candidate_column_config(),
                 )
 
@@ -1458,6 +1627,8 @@ def render_realtime_tab() -> None:
     )
     us_scan = _enrich_recommendation_frame(us_scan, scan_type="realtime_scan", market="US", pattern_lookup=pattern_lookup)
     kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="realtime_scan", market="KR", pattern_lookup=pattern_lookup)
+    us_scan = _attach_latest_quotes(us_scan, default_market="US")
+    kr_scan = _attach_latest_quotes(kr_scan, default_market="KR")
 
     us_tab, kr_tab = st.tabs(["미국", "한국"])
     with us_tab:
@@ -1476,6 +1647,8 @@ def render_realtime_tab() -> None:
                     "recent_target_rate_5d",
                     "score",
                     "current_price",
+                    "change_pct",
+                    "quote_as_of",
                     "regime",
                     "regime_delta",
                     "learning_delta",
@@ -1487,6 +1660,7 @@ def render_realtime_tab() -> None:
             ]
             _show_table(
                 us_view,
+                datetime_columns=["quote_as_of"],
                 currency_columns=["current_price"],
                 default_market="US",
                 column_config=_candidate_column_config(),
@@ -1509,6 +1683,8 @@ def render_realtime_tab() -> None:
                     "recent_target_rate_5d",
                     "score",
                     "current_price",
+                    "change_pct",
+                    "quote_as_of",
                     "regime",
                     "regime_delta",
                     "learning_delta",
@@ -1520,6 +1696,7 @@ def render_realtime_tab() -> None:
             ]
             _show_table(
                 kr_view,
+                datetime_columns=["quote_as_of"],
                 currency_columns=["current_price"],
                 default_market="KR",
                 column_config=_candidate_column_config(),
@@ -1550,12 +1727,15 @@ def render_realtime_tab() -> None:
                 "regime_delta",
                 "learning_delta",
                 "current_price",
+                "change_pct",
+                "quote_as_of",
                 "volume_ratio",
                 "short_return_pct",
                 "above_vwap",
                 "reason",
             ]
         ],
+        datetime_columns=["quote_as_of"],
         currency_columns=["current_price"],
         column_config=_candidate_column_config(),
     )
@@ -1999,6 +2179,10 @@ def render_short_term_trade_tab() -> None:
     kr_trades = _enrich_recommendation_frame(kr_trades, scan_type="short_term_trade", market="KR", pattern_lookup=pattern_lookup)
     us_high_risk = _enrich_recommendation_frame(us_high_risk, scan_type="high_risk_trade", market="US", pattern_lookup=pattern_lookup)
     kr_high_risk = _enrich_recommendation_frame(kr_high_risk, scan_type="high_risk_trade", market="KR", pattern_lookup=pattern_lookup)
+    us_trades = _attach_latest_quotes(us_trades, default_market="US")
+    kr_trades = _attach_latest_quotes(kr_trades, default_market="KR")
+    us_high_risk = _attach_latest_quotes(us_high_risk, default_market="US")
+    kr_high_risk = _attach_latest_quotes(kr_high_risk, default_market="KR")
 
     combined = pd.concat(
         [
@@ -2039,6 +2223,9 @@ def render_short_term_trade_tab() -> None:
                         "recent_hit_rate_20d",
                         "recent_target_rate_5d",
                         "score",
+                        "current_price",
+                        "change_pct",
+                        "quote_as_of",
                         "entry_price",
                         "stop_loss",
                         "target_1",
@@ -2053,7 +2240,8 @@ def render_short_term_trade_tab() -> None:
                 ]
                 _show_table(
                     us_normal_view,
-                    currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="US",
                     column_config=_trade_column_config(),
                 )
@@ -2074,6 +2262,9 @@ def render_short_term_trade_tab() -> None:
                         "recent_hit_rate_20d",
                         "recent_target_rate_5d",
                         "score",
+                        "current_price",
+                        "change_pct",
+                        "quote_as_of",
                         "entry_price",
                         "stop_loss",
                         "target_1",
@@ -2088,7 +2279,8 @@ def render_short_term_trade_tab() -> None:
                 ]
                 _show_table(
                     us_risky_view,
-                    currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="US",
                     column_config=_trade_column_config(),
                 )
@@ -2110,6 +2302,9 @@ def render_short_term_trade_tab() -> None:
                         "recent_hit_rate_20d",
                         "recent_target_rate_5d",
                         "score",
+                        "current_price",
+                        "change_pct",
+                        "quote_as_of",
                         "entry_price",
                         "stop_loss",
                         "target_1",
@@ -2124,7 +2319,8 @@ def render_short_term_trade_tab() -> None:
                 ]
                 _show_table(
                     kr_normal_view,
-                    currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="KR",
                     column_config=_trade_column_config(),
                 )
@@ -2145,6 +2341,9 @@ def render_short_term_trade_tab() -> None:
                         "recent_hit_rate_20d",
                         "recent_target_rate_5d",
                         "score",
+                        "current_price",
+                        "change_pct",
+                        "quote_as_of",
                         "entry_price",
                         "stop_loss",
                         "target_1",
@@ -2159,7 +2358,8 @@ def render_short_term_trade_tab() -> None:
                 ]
                 _show_table(
                     kr_risky_view,
-                    currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="KR",
                     column_config=_trade_column_config(),
                 )
