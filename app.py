@@ -5,7 +5,7 @@ import streamlit as st
 
 from src.automation.scheduler import BackgroundAnalyzer
 from src.backtest.engine import run_backtest
-from src.data.fetch import get_intraday_stock_data, get_stock_data
+from src.data.fetch import get_intraday_stock_data, get_latest_quote, get_stock_data
 from src.portfolio.analytics import analyze_portfolio, build_rebalance_suggestions
 from src.portfolio.models import PositionInput
 from src.storage.local_store import (
@@ -320,6 +320,8 @@ def _manual_tracking_column_config() -> dict[str, object]:
         "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
         "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
         "current_price": st.column_config.TextColumn("현재가", width="small"),
+        "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
+        "current_return_pct": st.column_config.NumberColumn("현재수익률", format="%.2f", width="small"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
         "target_1": st.column_config.TextColumn("목표가", width="small"),
@@ -328,6 +330,8 @@ def _manual_tracking_column_config() -> dict[str, object]:
         "ret_20d_pct": st.column_config.NumberColumn("20일", format="%.2f", width="small"),
         "path_5d": st.column_config.TextColumn("5일경로", width="small"),
         "path_20d": st.column_config.TextColumn("20일경로", width="small"),
+        "alert_status": st.column_config.TextColumn("현재상태", width="small"),
+        "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
         "memo": st.column_config.TextColumn("메모", width="medium"),
         "created_at": st.column_config.TextColumn("추가시각", width="small"),
     }
@@ -468,6 +472,14 @@ def get_tracking_state() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.D
     except Exception:
         empty = pd.DataFrame()
         return empty, empty, empty, empty, empty
+
+
+def _clear_all_cached_data() -> None:
+    get_stock_data.clear()
+    get_intraday_stock_data.clear()
+    get_latest_quote.clear()
+    get_learning_state.clear()
+    get_tracking_state.clear()
 
 
 def _score_band(score: float) -> str:
@@ -718,6 +730,22 @@ def _render_manual_tracking_quick_add(
         append_manual_tracking(selected)
         append_scan_history("manual_track", str(selected["market"]), pd.DataFrame([selected]))
         st.success(f"{selected['ticker']}를 관심 추적에 추가했습니다.")
+
+
+def _manual_alert_status(current_price: float | None, stop_loss: float | None, target_1: float | None) -> str:
+    if current_price is None or pd.isna(current_price):
+        return "시세대기"
+    if stop_loss is not None and not pd.isna(stop_loss):
+        if current_price <= stop_loss:
+            return "손절구간"
+        if current_price <= stop_loss * 1.02:
+            return "손절근접"
+    if target_1 is not None and not pd.isna(target_1):
+        if current_price >= target_1:
+            return "목표도달"
+        if current_price >= target_1 * 0.98:
+            return "목표근접"
+    return "추적중"
 
 
 def render_portfolio_editor() -> None:
@@ -1762,6 +1790,47 @@ def render_manual_tracking_tab() -> None:
         tracked_view["score_view"] = tracked_view["score"].apply(lambda value: _score_view(float(value)) if str(value) != "" else "")
         tracked_view["recent_hit_rate_20d"] = 0.0
         tracked_view["recent_target_rate_5d"] = 0.0
+        current_prices: list[float | None] = []
+        change_pcts: list[float | None] = []
+        current_returns: list[float | None] = []
+        alert_statuses: list[str] = []
+        quote_as_ofs: list[str] = []
+        for _, row in tracked_view.iterrows():
+            quote = get_latest_quote(str(row.get("ticker", "")))
+            current_price = pd.to_numeric(quote.get("current_price", None), errors="coerce")
+            entry_price = pd.to_numeric(row.get("entry_price", None), errors="coerce")
+            stop_loss = pd.to_numeric(row.get("stop_loss", None), errors="coerce")
+            target_1 = pd.to_numeric(row.get("target_1", None), errors="coerce")
+
+            current_prices.append(None if pd.isna(current_price) else float(current_price))
+            change_pcts.append(pd.to_numeric(quote.get("change_pct", None), errors="coerce"))
+            if pd.isna(current_price) or pd.isna(entry_price) or float(entry_price) <= 0:
+                current_returns.append(None)
+            else:
+                current_returns.append((float(current_price) - float(entry_price)) / float(entry_price) * 100)
+            alert_statuses.append(
+                _manual_alert_status(
+                    None if pd.isna(current_price) else float(current_price),
+                    None if pd.isna(stop_loss) else float(stop_loss),
+                    None if pd.isna(target_1) else float(target_1),
+                )
+            )
+            quote_as_ofs.append(str(quote.get("as_of", "")))
+
+        tracked_view["current_price"] = current_prices
+        tracked_view["change_pct"] = change_pcts
+        tracked_view["current_return_pct"] = current_returns
+        tracked_view["alert_status"] = alert_statuses
+        tracked_view["quote_as_of"] = quote_as_ofs
+
+        active_count = int((tracked_view["alert_status"] == "추적중").sum())
+        target_count = int((tracked_view["alert_status"] == "목표도달").sum())
+        risk_count = int(tracked_view["alert_status"].isin(["손절근접", "손절구간"]).sum())
+        m1, m2, m3 = st.columns(3)
+        m1.metric("현재 추적중", f"{active_count}")
+        m2.metric("목표 도달", f"{target_count}")
+        m3.metric("주의 필요", f"{risk_count}")
+
         _show_table(
             tracked_view[
                 [
@@ -1772,6 +1841,8 @@ def render_manual_tracking_tab() -> None:
                     "setup",
                     "score_view",
                     "current_price",
+                    "change_pct",
+                    "current_return_pct",
                     "entry_price",
                     "stop_loss",
                     "target_1",
@@ -1780,11 +1851,13 @@ def render_manual_tracking_tab() -> None:
                     "ret_20d_pct",
                     "path_5d",
                     "path_20d",
+                    "alert_status",
+                    "quote_as_of",
                     "memo",
                     "created_at",
                 ]
             ],
-            datetime_columns=["created_at"],
+            datetime_columns=["created_at", "quote_as_of"],
             currency_columns=["current_price", "entry_price", "stop_loss", "target_1"],
             column_config=_manual_tracking_column_config(),
         )
@@ -2102,8 +2175,16 @@ def render_short_term_trade_tab() -> None:
 def main() -> None:
     init_state()
     _inject_ui_style()
-    st.title("Stock Decision Helper")
-    st.caption("한국/미국 주식을 함께 보며 보유 종목 관리와 간단한 추천 액션을 확인하는 1차 MVP입니다.")
+    title_col, action_col = st.columns([6, 1])
+    with title_col:
+        st.title("Stock Decision Helper")
+        st.caption("한국/미국 주식을 함께 보며 보유 종목 관리와 간단한 추천 액션을 확인하는 1차 MVP입니다.")
+    with action_col:
+        st.write("")
+        st.write("")
+        if st.button("전체 새로고침", use_container_width=True):
+            _clear_all_cached_data()
+            st.rerun()
 
     _, ticker = render_sidebar()
     page = st.radio(

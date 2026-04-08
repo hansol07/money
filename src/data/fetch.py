@@ -111,6 +111,104 @@ def get_intraday_stock_data(ticker: str, period: str = "5d", interval: str = "5m
     return df.dropna().reset_index(drop=True)
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def get_latest_quote(ticker: str) -> dict[str, object]:
+    ticker = ticker.strip().upper()
+    empty_result = {
+        "current_price": None,
+        "prev_close": None,
+        "change_pct": None,
+        "as_of": "",
+        "source": "",
+    }
+    if not ticker:
+        return empty_result
+
+    try:
+        intraday = yf.download(
+            ticker,
+            period="1d",
+            interval="5m",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        intraday = pd.DataFrame()
+
+    if not intraday.empty:
+        if isinstance(intraday.columns, pd.MultiIndex):
+            intraday.columns = intraday.columns.get_level_values(0)
+        intraday = intraday.rename_axis("Datetime").reset_index()
+        time_column = "Datetime" if "Datetime" in intraday.columns else "Date"
+        intraday = intraday.rename(columns={time_column: "Datetime"})
+        intraday = intraday.dropna(subset=["Close"])
+        if not intraday.empty:
+            current_price = float(intraday["Close"].iloc[-1])
+            as_of = pd.to_datetime(intraday["Datetime"].iloc[-1], errors="coerce")
+            prev_close = None
+            change_pct = None
+            try:
+                daily = yf.download(
+                    ticker,
+                    period="5d",
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
+            except Exception:
+                daily = pd.DataFrame()
+            if not daily.empty:
+                if isinstance(daily.columns, pd.MultiIndex):
+                    daily.columns = daily.columns.get_level_values(0)
+                daily = daily.dropna(subset=["Close"])
+                if len(daily) >= 2:
+                    prev_close = float(daily["Close"].iloc[-2])
+                    if prev_close > 0:
+                        change_pct = (current_price - prev_close) / prev_close * 100
+            return {
+                "current_price": round(current_price, 4),
+                "prev_close": round(prev_close, 4) if prev_close is not None else None,
+                "change_pct": round(change_pct, 2) if change_pct is not None else None,
+                "as_of": pd.Timestamp(as_of).strftime("%Y-%m-%d %H:%M") if not pd.isna(as_of) else "",
+                "source": "5m",
+            }
+
+    try:
+        daily = yf.download(
+            ticker,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        daily = pd.DataFrame()
+
+    if daily.empty:
+        return empty_result
+
+    if isinstance(daily.columns, pd.MultiIndex):
+        daily.columns = daily.columns.get_level_values(0)
+    daily = daily.rename_axis("Date").reset_index().dropna(subset=["Close"])
+    if daily.empty:
+        return empty_result
+
+    current_price = float(daily["Close"].iloc[-1])
+    prev_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else None
+    change_pct = ((current_price - prev_close) / prev_close * 100) if prev_close and prev_close > 0 else None
+    as_of = pd.to_datetime(daily["Date"].iloc[-1], errors="coerce")
+    return {
+        "current_price": round(current_price, 4),
+        "prev_close": round(prev_close, 4) if prev_close is not None else None,
+        "change_pct": round(change_pct, 2) if change_pct is not None else None,
+        "as_of": pd.Timestamp(as_of).strftime("%Y-%m-%d") if not pd.isna(as_of) else "",
+        "source": "1d",
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_dividend_yield(ticker: str) -> float:
     ticker = ticker.strip().upper()

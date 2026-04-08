@@ -39,6 +39,7 @@ streamlit run app.py
 ## 파일 안내
 
 - [상세 한국어 매뉴얼](C:\Users\njwjs\Desktop\개발\주식\MANUAL_KO.md)
+- [다음 개발 TODO](C:\Users\njwjs\Desktop\개발\주식\TODO.md)
 - 실행 파일: [app.py](C:\Users\njwjs\Desktop\개발\주식\app.py)
 - 저장 폴더: [data](C:\Users\njwjs\Desktop\개발\주식\data)
 
@@ -76,3 +77,11 @@ python -m venv .venv
 pip install -r requirements.txt
 streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
+
+## 문서 운영 원칙
+
+앞으로 Git에 push 할 때는 아래 문서를 같이 갱신하는 것을 기본 원칙으로 둡니다.
+
+- `README.md`: 빠른 실행, 핵심 기능, 진입 안내
+- `MANUAL_KO.md`: 실제 사용 방법과 화면별 설명
+- `TODO.md`: 다음 개발 항목과 우선순위
