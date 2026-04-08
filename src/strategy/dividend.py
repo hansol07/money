@@ -71,6 +71,9 @@ def _stable_dividend_score(data: pd.DataFrame, details: dict[str, object]) -> tu
     if latest["Close"] > latest["ma120"]:
         score += 18
         reasons.append("긴 흐름도 아직 무너지지 않았습니다.")
+    if latest["from_52w_high_pct"] >= -15:
+        score += 10
+        reasons.append("고점 대비 크게 무너지지 않아 체력이 남아 있습니다.")
     if volatility <= 28:
         score += 16
         reasons.append("흔들림이 심하지 않아 모으기 좋습니다.")
@@ -105,6 +108,9 @@ def _growth_dividend_score(data: pd.DataFrame, details: dict[str, object]) -> tu
     if latest["Close"] > latest["ma20"] > latest["ma60"]:
         score += 18
         reasons.append("가격 흐름도 위쪽으로 정리돼 있습니다.")
+    if latest["rs_score"] >= 8:
+        score += 8
+        reasons.append("상대강도도 괜찮아 배당 성장주 성격이 있습니다.")
     if annual_return > 10:
         score += 14
         reasons.append("배당 성장에 가격 상승도 같이 붙었습니다.")
@@ -122,56 +128,59 @@ def build_dividend_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
     growth_rows: list[dict[str, object]] = []
 
     for item in get_dividend_universe(market):
-        data = get_stock_data(item["ticker"])
-        if data.empty or len(data) < 180:
-            continue
+        try:
+            data = get_stock_data(item["ticker"])
+            if data.empty or len(data) < 180:
+                continue
 
-        details = get_stock_dividend_details(item["ticker"])
-        dividend_yield = float(details["dividend_yield_pct"])
-        if dividend_yield <= 0:
-            continue
+            details = get_stock_dividend_details(item["ticker"])
+            dividend_yield = float(details["dividend_yield_pct"])
+            if dividend_yield <= 0:
+                continue
 
-        latest = data.iloc[-1]
-        zone_low, zone_high = _build_accumulate_zone(latest)
-        close_price = float(latest["Close"])
-        action = _build_action(close_price, zone_low, zone_high, str(details["ex_dividend_date"]))
-        pullback_pct = (close_price / float(data["Close"].tail(252).max()) - 1) * 100 if len(data) >= 252 else 0.0
+            latest = data.iloc[-1]
+            zone_low, zone_high = _build_accumulate_zone(latest)
+            close_price = float(latest["Close"])
+            action = _build_action(close_price, zone_low, zone_high, str(details["ex_dividend_date"]))
+            pullback_pct = (close_price / float(data["Close"].tail(252).max()) - 1) * 100 if len(data) >= 252 else 0.0
 
-        stable_score, stable_reasons = _stable_dividend_score(data, details)
-        growth_score, growth_reasons = _growth_dividend_score(data, details)
+            stable_score, stable_reasons = _stable_dividend_score(data, details)
+            growth_score, growth_reasons = _growth_dividend_score(data, details)
 
-        base = {
-            "ticker": item["ticker"],
-            "name": item["name"],
-            "current_price": round(close_price, 2),
-            "annual_dividend": round(float(details["annual_dividend"]), 4),
-            "dividend_yield_pct": round(dividend_yield, 2),
-            "dividend_growth_1y_pct": round(float(details["dividend_growth_1y_pct"]), 2),
-            "dividend_growth_3y_pct": round(float(details["dividend_growth_3y_pct"]), 2),
-            "dividend_events_1y": int(details["dividend_events_1y"]),
-            "ex_dividend_date": str(details["ex_dividend_date"]),
-            "accumulate_low": round(zone_low, 2),
-            "accumulate_high": round(zone_high, 2),
-            "pullback_pct": round(pullback_pct, 2),
-            "action": action,
-        }
-
-        stable_rows.append(
-            {
-                **base,
-                "score": stable_score,
-                "style": "안정 배당",
-                "reason": " / ".join(stable_reasons[:3]),
+            base = {
+                "ticker": item["ticker"],
+                "name": item["name"],
+                "current_price": round(close_price, 2),
+                "annual_dividend": round(float(details["annual_dividend"]), 4),
+                "dividend_yield_pct": round(dividend_yield, 2),
+                "dividend_growth_1y_pct": round(float(details["dividend_growth_1y_pct"]), 2),
+                "dividend_growth_3y_pct": round(float(details["dividend_growth_3y_pct"]), 2),
+                "dividend_events_1y": int(details["dividend_events_1y"]),
+                "ex_dividend_date": str(details["ex_dividend_date"]),
+                "accumulate_low": round(zone_low, 2),
+                "accumulate_high": round(zone_high, 2),
+                "pullback_pct": round(pullback_pct, 2),
+                "action": action,
             }
-        )
-        growth_rows.append(
-            {
-                **base,
-                "score": growth_score,
-                "style": "배당 성장",
-                "reason": " / ".join(growth_reasons[:3]),
-            }
-        )
+
+            stable_rows.append(
+                {
+                    **base,
+                    "score": stable_score,
+                    "style": "안정 배당",
+                    "reason": " / ".join(stable_reasons[:3]),
+                }
+            )
+            growth_rows.append(
+                {
+                    **base,
+                    "score": growth_score,
+                    "style": "배당 성장",
+                    "reason": " / ".join(growth_reasons[:3]),
+                }
+            )
+        except Exception:
+            continue
 
     def _sort_rows(rows: list[dict[str, object]], sort_columns: list[str]) -> pd.DataFrame:
         if not rows:

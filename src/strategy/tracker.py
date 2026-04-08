@@ -14,7 +14,9 @@ def _get_future_rows(data: pd.DataFrame, captured_at: str) -> pd.DataFrame:
     if pd.isna(captured_date):
         return pd.DataFrame()
 
-    rows = data[pd.to_datetime(data["Date"]) >= captured_date.normalize()].copy()
+    date_series = pd.to_datetime(data["Date"], errors="coerce")
+    compare_date = pd.Timestamp(captured_date).normalize().to_datetime64()
+    rows = data[date_series.to_numpy(dtype="datetime64[ns]") >= compare_date].copy()
     if rows.empty:
         return pd.DataFrame()
     return rows.reset_index(drop=True)

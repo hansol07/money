@@ -10,11 +10,14 @@ from src.portfolio.analytics import analyze_portfolio, build_rebalance_suggestio
 from src.portfolio.models import PositionInput
 from src.storage.local_store import (
     append_scan_history,
+    append_manual_tracking,
     load_feature_log,
+    load_manual_tracking,
     load_portfolio,
     load_scan_history,
     load_watchlists,
     normalize_portfolio_frame,
+    remove_manual_tracking,
     save_portfolio,
     save_watchlists,
 )
@@ -36,6 +39,48 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+
+def _inject_ui_style() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.4rem;
+            padding-bottom: 2.2rem;
+        }
+        div[role="radiogroup"] {
+            gap: 0.5rem;
+            padding: 0.2rem 0 0.6rem 0;
+            flex-wrap: wrap;
+        }
+        div[role="radiogroup"] label {
+            border: 1px solid #d6dde8;
+            border-radius: 999px;
+            padding: 0.35rem 0.8rem;
+            background: #ffffff;
+        }
+        div[role="radiogroup"] label:has(input:checked) {
+            border-color: #1f4f8a;
+            background: #eef5ff;
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid #e7edf5;
+            border-radius: 14px;
+            padding: 0.8rem 0.9rem;
+            background: #fbfdff;
+        }
+        div[data-testid="stDataFrame"] {
+            border-radius: 14px;
+            overflow: hidden;
+        }
+        .stCaptionContainer p {
+            color: #5a6678;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _compact_timestamp(value: object) -> str:
@@ -116,7 +161,11 @@ def _candidate_column_config() -> dict[str, object]:
         "name": st.column_config.TextColumn("종목명", width="small"),
         "setup": st.column_config.TextColumn("세팅", width="small"),
         "action": st.column_config.TextColumn("액션", width="small"),
+        "score_view": st.column_config.TextColumn("점수판단", width="small"),
         "score": st.column_config.NumberColumn("점수", format="%d", width="small"),
+        "score_band": st.column_config.TextColumn("등급", width="small"),
+        "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
+        "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
         "current_price": st.column_config.TextColumn("현재가", width="small"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
@@ -130,6 +179,9 @@ def _candidate_column_config() -> dict[str, object]:
         "breakout_score": st.column_config.NumberColumn("돌파", format="%d", width="small"),
         "volume_ratio": st.column_config.NumberColumn("거래량배수", format="%.2f", width="small"),
         "return_20d": st.column_config.NumberColumn("20일수익률", format="%.2f", width="small"),
+        "rs_score": st.column_config.NumberColumn("상대강도", format="%.2f", width="small"),
+        "atr_pct": st.column_config.NumberColumn("ATR%", format="%.2f", width="small"),
+        "from_52w_high_pct": st.column_config.NumberColumn("52주고점대비", format="%.2f", width="small"),
         "return_60d_pct": st.column_config.NumberColumn("60일수익률", format="%.2f", width="small"),
         "return_1y_pct": st.column_config.NumberColumn("1년수익률", format="%.2f", width="small"),
         "reason": st.column_config.TextColumn("핵심 사유", width="large"),
@@ -235,7 +287,11 @@ def _trade_column_config() -> dict[str, object]:
         "name": st.column_config.TextColumn("종목명", width="small"),
         "risk_level": st.column_config.TextColumn("위험도", width="small"),
         "setup": st.column_config.TextColumn("세팅", width="small"),
+        "score_view": st.column_config.TextColumn("점수판단", width="small"),
         "score": st.column_config.NumberColumn("점수", format="%d", width="small"),
+        "score_band": st.column_config.TextColumn("등급", width="small"),
+        "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
+        "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
         "target_1": st.column_config.TextColumn("1차목표", width="small"),
@@ -245,9 +301,35 @@ def _trade_column_config() -> dict[str, object]:
         "learning_delta": st.column_config.NumberColumn("학습보정", format="%d", width="small"),
         "short_return_pct": st.column_config.NumberColumn("단기탄력", format="%.2f", width="small"),
         "volume_ratio": st.column_config.NumberColumn("거래량배수", format="%.2f", width="small"),
+        "atr_pct": st.column_config.NumberColumn("ATR%", format="%.2f", width="small"),
+        "rs_score": st.column_config.NumberColumn("상대강도", format="%.2f", width="small"),
         "risk_reward_1": st.column_config.NumberColumn("1차손익비", format="%.2f", width="small"),
         "exit_rule": st.column_config.TextColumn("청산기준", width="medium"),
         "reason": st.column_config.TextColumn("핵심 사유", width="large"),
+    }
+
+
+def _manual_tracking_column_config() -> dict[str, object]:
+    return {
+        "market": st.column_config.TextColumn("시장", width="small"),
+        "ticker": st.column_config.TextColumn("티커", width="small"),
+        "name": st.column_config.TextColumn("종목명", width="small"),
+        "source": st.column_config.TextColumn("출처", width="small"),
+        "setup": st.column_config.TextColumn("세팅", width="small"),
+        "score_view": st.column_config.TextColumn("점수판단", width="small"),
+        "recent_hit_rate_20d": st.column_config.NumberColumn("최근적중률", format="%.1f", width="small"),
+        "recent_target_rate_5d": st.column_config.NumberColumn("최근목표도달", format="%.1f", width="small"),
+        "current_price": st.column_config.TextColumn("현재가", width="small"),
+        "entry_price": st.column_config.TextColumn("진입가", width="small"),
+        "stop_loss": st.column_config.TextColumn("손절가", width="small"),
+        "target_1": st.column_config.TextColumn("목표가", width="small"),
+        "ret_3d_pct": st.column_config.NumberColumn("3일", format="%.2f", width="small"),
+        "ret_5d_pct": st.column_config.NumberColumn("5일", format="%.2f", width="small"),
+        "ret_20d_pct": st.column_config.NumberColumn("20일", format="%.2f", width="small"),
+        "path_5d": st.column_config.TextColumn("5일경로", width="small"),
+        "path_20d": st.column_config.TextColumn("20일경로", width="small"),
+        "memo": st.column_config.TextColumn("메모", width="medium"),
+        "created_at": st.column_config.TextColumn("추가시각", width="small"),
     }
 
 
@@ -377,6 +459,265 @@ def render_sidebar() -> tuple[str, str]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_learning_state() -> tuple[dict[tuple[str, str, str], object], pd.DataFrame]:
     return build_learning_adjustments(limit=400, min_samples=3)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_tracking_state() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    try:
+        return evaluate_scan_history(limit=400)
+    except Exception:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
+
+
+def _score_band(score: float) -> str:
+    if score >= 85:
+        return "매우강함"
+    if score >= 75:
+        return "강함"
+    if score >= 65:
+        return "관심"
+    if score >= 55:
+        return "보통"
+    return "주의"
+
+
+def _score_view(score: float) -> str:
+    band = _score_band(score)
+    if band == "매우강함":
+        return f"{int(round(score))} / 바로확인"
+    if band == "강함":
+        return f"{int(round(score))} / 꽤좋음"
+    if band == "관심":
+        return f"{int(round(score))} / 볼만함"
+    if band == "보통":
+        return f"{int(round(score))} / 애매함"
+    return f"{int(round(score))} / 조심"
+
+
+def _build_pattern_lookup(pattern_stats: pd.DataFrame) -> dict[tuple[str, str, str], dict[str, float]]:
+    if pattern_stats.empty:
+        return {}
+
+    lookup: dict[tuple[str, str, str], dict[str, float]] = {}
+    for _, row in pattern_stats.iterrows():
+        key = (
+            str(row.get("scan_type", "")),
+            str(row.get("market", "")),
+            str(row.get("setup", "")),
+        )
+        lookup[key] = {
+            "hit_rate_20d_pct": float(row.get("hit_rate_20d_pct", 0) or 0),
+            "target_first_5d_pct": float(row.get("target_first_5d_pct", 0) or 0),
+            "picks": float(row.get("picks", 0) or 0),
+        }
+    return lookup
+
+
+def _enrich_recommendation_frame(
+    frame: pd.DataFrame,
+    *,
+    scan_type: str,
+    market: str,
+    pattern_lookup: dict[tuple[str, str, str], dict[str, float]],
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+
+    enriched = frame.copy()
+    enriched["score_band"] = enriched["score"].apply(lambda value: _score_band(float(value)))
+    enriched["score_view"] = enriched["score"].apply(lambda value: _score_view(float(value)))
+
+    recent_hits: list[float] = []
+    recent_targets: list[float] = []
+    for _, row in enriched.iterrows():
+        setup = str(row.get("setup", "") or "미분류")
+        stats = pattern_lookup.get((scan_type, market, setup), {})
+        recent_hits.append(round(float(stats.get("hit_rate_20d_pct", 0.0)), 1))
+        recent_targets.append(round(float(stats.get("target_first_5d_pct", 0.0)), 1))
+
+    enriched["recent_hit_rate_20d"] = recent_hits
+    enriched["recent_target_rate_5d"] = recent_targets
+    return enriched
+
+
+def _build_manual_tracking_pool() -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    learning_adjustments, _ = get_learning_state()
+    _, _, _, _, pattern_stats = get_tracking_state()
+    pattern_lookup = _build_pattern_lookup(pattern_stats)
+    min_score = int(st.session_state.scanner_settings["min_score"])
+    interval = str(st.session_state.realtime_settings["interval"])
+    realtime_min_score = int(st.session_state.realtime_settings["min_score"])
+    top_n = int(st.session_state.scanner_settings["top_n"])
+
+    sources: list[tuple[str, str, pd.DataFrame]] = [
+        (
+            "오늘추천",
+            "today_scan",
+            pd.concat(
+                [
+                    _enrich_recommendation_frame(
+                        scan_market("US", st.session_state.watchlists["US"], min_score=min_score, learning_adjustments=learning_adjustments),
+                        scan_type="today_scan",
+                        market="US",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="US"),
+                    _enrich_recommendation_frame(
+                        scan_market("KR", st.session_state.watchlists["KR"], min_score=min_score, learning_adjustments=learning_adjustments),
+                        scan_type="today_scan",
+                        market="KR",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="KR"),
+                ],
+                ignore_index=True,
+            ),
+        ),
+        (
+            "실시간",
+            "realtime_scan",
+            pd.concat(
+                [
+                    _enrich_recommendation_frame(
+                        scan_intraday_market("US", st.session_state.watchlists["US"], interval=interval, min_score=realtime_min_score, learning_adjustments=learning_adjustments),
+                        scan_type="realtime_scan",
+                        market="US",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="US"),
+                    _enrich_recommendation_frame(
+                        scan_intraday_market("KR", st.session_state.watchlists["KR"], interval=interval, min_score=realtime_min_score, learning_adjustments=learning_adjustments),
+                        scan_type="realtime_scan",
+                        market="KR",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="KR"),
+                ],
+                ignore_index=True,
+            ),
+        ),
+        (
+            "일반단타",
+            "short_term_trade",
+            pd.concat(
+                [
+                    _enrich_recommendation_frame(
+                        build_short_term_trade_candidates("US", top_n=top_n, interval=interval, min_score=max(60, realtime_min_score), learning_adjustments=learning_adjustments),
+                        scan_type="short_term_trade",
+                        market="US",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="US"),
+                    _enrich_recommendation_frame(
+                        build_short_term_trade_candidates("KR", top_n=top_n, interval=interval, min_score=max(60, realtime_min_score), learning_adjustments=learning_adjustments),
+                        scan_type="short_term_trade",
+                        market="KR",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="KR"),
+                ],
+                ignore_index=True,
+            ),
+        ),
+        (
+            "고위험단타",
+            "high_risk_trade",
+            pd.concat(
+                [
+                    _enrich_recommendation_frame(
+                        build_high_risk_trade_candidates("US", top_n=top_n, interval=interval, min_score=60, learning_adjustments=learning_adjustments),
+                        scan_type="high_risk_trade",
+                        market="US",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="US"),
+                    _enrich_recommendation_frame(
+                        build_high_risk_trade_candidates("KR", top_n=top_n, interval=interval, min_score=60, learning_adjustments=learning_adjustments),
+                        scan_type="high_risk_trade",
+                        market="KR",
+                        pattern_lookup=pattern_lookup,
+                    ).assign(market="KR"),
+                ],
+                ignore_index=True,
+            ),
+        ),
+    ]
+
+    for source_name, scan_type, frame in sources:
+        if frame.empty:
+            continue
+        normalized = frame.copy()
+        normalized["source"] = source_name
+        normalized["scan_type"] = scan_type
+        for column in ["current_price", "entry_price", "stop_loss", "target_1", "recent_hit_rate_20d", "recent_target_rate_5d", "score_view"]:
+            if column not in normalized.columns:
+                normalized[column] = ""
+        frames.append(
+            normalized[
+                [
+                    "market",
+                    "ticker",
+                    "name",
+                    "source",
+                    "scan_type",
+                    "setup",
+                    "score",
+                    "score_view",
+                    "current_price",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "recent_hit_rate_20d",
+                    "recent_target_rate_5d",
+                ]
+            ]
+        )
+
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.drop_duplicates(subset=["market", "ticker", "source"], keep="first").reset_index(drop=True)
+
+
+def _render_manual_tracking_quick_add(
+    frame: pd.DataFrame,
+    *,
+    source_label: str,
+    key_prefix: str,
+    default_market: str | None = None,
+) -> None:
+    if frame.empty:
+        return
+
+    working = frame.copy()
+    if "market" not in working.columns and default_market is not None:
+        working["market"] = default_market
+    if "source" not in working.columns:
+        working["source"] = source_label
+
+    labels = {
+        f"{row.get('market', default_market or '')} | {row.get('ticker', '')} | {row.get('name', '')}": row
+        for _, row in working.iterrows()
+    }
+    if not labels:
+        return
+
+    st.caption("이 표에서 바로 관심 추적에 추가할 수 있습니다.")
+    selected_label = st.selectbox(
+        "관심 추적 추가",
+        options=list(labels.keys()),
+        key=f"{key_prefix}_tracking_select",
+        label_visibility="collapsed",
+    )
+    memo = st.text_input(
+        "메모",
+        key=f"{key_prefix}_tracking_memo",
+        placeholder="왜 보는 종목인지 짧게 남겨도 됩니다.",
+        label_visibility="collapsed",
+    )
+    if st.button("이 종목 관심 추적 추가", key=f"{key_prefix}_tracking_button", use_container_width=True):
+        selected = dict(labels[selected_label])
+        selected["market"] = selected.get("market", default_market or "")
+        selected["source"] = selected.get("source", source_label)
+        selected["memo"] = memo.strip()
+        append_manual_tracking(selected)
+        append_scan_history("manual_track", str(selected["market"]), pd.DataFrame([selected]))
+        st.success(f"{selected['ticker']}를 관심 추적에 추가했습니다.")
 
 
 def render_portfolio_editor() -> None:
@@ -708,11 +1049,15 @@ def render_market_scanner() -> None:
     st.caption("대표 후보군을 빠르게 훑어서 오늘 상대적으로 강한 종목을 점수화합니다.")
     min_score = int(st.session_state.scanner_settings["min_score"])
     learning_adjustments, _ = get_learning_state()
+    _, _, _, _, pattern_stats = get_tracking_state()
+    pattern_lookup = _build_pattern_lookup(pattern_stats)
     us_regime = classify_market_regime("US")
     kr_regime = classify_market_regime("KR")
 
     us_scan = scan_market("US", st.session_state.watchlists["US"], min_score=min_score, learning_adjustments=learning_adjustments)
     kr_scan = scan_market("KR", st.session_state.watchlists["KR"], min_score=min_score, learning_adjustments=learning_adjustments)
+    us_scan = _enrich_recommendation_frame(us_scan, scan_type="today_scan", market="US", pattern_lookup=pattern_lookup)
+    kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="today_scan", market="KR", pattern_lookup=pattern_lookup)
 
     us_tab, kr_tab = st.tabs(["미국", "한국"])
     with us_tab:
@@ -720,62 +1065,80 @@ def render_market_scanner() -> None:
         if us_scan.empty:
             st.info("조건을 만족한 미국 후보가 없습니다.")
         else:
+            us_view = us_scan[
+                [
+                    "ticker",
+                    "name",
+                    "setup",
+                    "action",
+                    "score_view",
+                    "score_band",
+                    "recent_hit_rate_20d",
+                    "recent_target_rate_5d",
+                    "score",
+                    "regime",
+                    "regime_delta",
+                    "learning_delta",
+                    "rs_score",
+                    "atr_pct",
+                    "from_52w_high_pct",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "trend_score",
+                    "momentum_score",
+                    "volume_score",
+                    "breakout_score",
+                    "reason",
+                ]
+            ]
             _show_table(
-                us_scan[
-                    [
-                        "ticker",
-                        "name",
-                        "setup",
-                        "action",
-                        "score",
-                        "regime",
-                        "regime_delta",
-                        "learning_delta",
-                        "entry_price",
-                        "stop_loss",
-                        "target_1",
-                        "trend_score",
-                        "momentum_score",
-                        "volume_score",
-                        "breakout_score",
-                        "reason",
-                    ]
-                ],
+                us_view,
                 currency_columns=["entry_price", "stop_loss", "target_1"],
                 default_market="US",
                 column_config=_candidate_column_config(),
             )
+            _render_manual_tracking_quick_add(us_scan, source_label="오늘추천", key_prefix="today_scan_us", default_market="US")
 
     with kr_tab:
         st.caption(f"장세: {kr_regime.regime} / {kr_regime.note}")
         if kr_scan.empty:
             st.info("조건을 만족한 한국 후보가 없습니다.")
         else:
+            kr_view = kr_scan[
+                [
+                    "ticker",
+                    "name",
+                    "setup",
+                    "action",
+                    "score_view",
+                    "score_band",
+                    "recent_hit_rate_20d",
+                    "recent_target_rate_5d",
+                    "score",
+                    "regime",
+                    "regime_delta",
+                    "learning_delta",
+                    "rs_score",
+                    "atr_pct",
+                    "from_52w_high_pct",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "trend_score",
+                    "momentum_score",
+                    "volume_score",
+                    "breakout_score",
+                    "reason",
+                ]
+            ]
             _show_table(
-                kr_scan[
-                    [
-                        "ticker",
-                        "name",
-                        "setup",
-                        "action",
-                        "score",
-                        "regime",
-                        "regime_delta",
-                        "learning_delta",
-                        "entry_price",
-                        "stop_loss",
-                        "target_1",
-                        "trend_score",
-                        "momentum_score",
-                        "volume_score",
-                        "breakout_score",
-                        "reason",
-                    ]
-                ],
+                kr_view,
                 currency_columns=["entry_price", "stop_loss", "target_1"],
                 default_market="KR",
                 column_config=_candidate_column_config(),
             )
+            _render_manual_tracking_quick_add(kr_scan, source_label="오늘추천", key_prefix="today_scan_kr", default_market="KR")
 
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
     if not combined.empty:
@@ -800,9 +1163,13 @@ def render_buy_now_panel() -> None:
     min_score = int(st.session_state.scanner_settings["min_score"])
     top_n = int(st.session_state.scanner_settings["top_n"])
     learning_adjustments, _ = get_learning_state()
+    _, _, _, _, pattern_stats = get_tracking_state()
+    pattern_lookup = _build_pattern_lookup(pattern_stats)
 
     us_scan = scan_market("US", st.session_state.watchlists["US"], min_score=min_score, learning_adjustments=learning_adjustments)
     kr_scan = scan_market("KR", st.session_state.watchlists["KR"], min_score=min_score, learning_adjustments=learning_adjustments)
+    us_scan = _enrich_recommendation_frame(us_scan, scan_type="today_scan", market="US", pattern_lookup=pattern_lookup)
+    kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="today_scan", market="KR", pattern_lookup=pattern_lookup)
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
 
     if combined.empty:
@@ -813,7 +1180,7 @@ def render_buy_now_panel() -> None:
     best_row = top.iloc[0]
     col1, col2, col3 = st.columns(3)
     col1.metric("최상위 후보", str(best_row["ticker"]))
-    col2.metric("최고 점수", int(best_row["score"]))
+    col2.metric("최고 판단", str(best_row["score_view"]))
     col3.metric("후보 수", len(combined))
     _show_table(
         top[
@@ -823,10 +1190,17 @@ def render_buy_now_panel() -> None:
                 "name",
                 "setup",
                 "action",
+                "score_view",
+                "score_band",
+                "recent_hit_rate_20d",
+                "recent_target_rate_5d",
                 "score",
                 "regime",
                 "regime_delta",
                 "learning_delta",
+                "rs_score",
+                "atr_pct",
+                "from_52w_high_pct",
                 "entry_price",
                 "stop_loss",
                 "target_1",
@@ -838,6 +1212,7 @@ def render_buy_now_panel() -> None:
         currency_columns=["entry_price", "stop_loss", "target_1"],
         column_config=_candidate_column_config(),
     )
+    _render_manual_tracking_quick_add(top, source_label="오늘바로볼종목", key_prefix="buy_now_top")
 
     st.markdown("#### 급등 후보 보드")
     momentum_board = combined.sort_values(
@@ -851,9 +1226,15 @@ def render_buy_now_panel() -> None:
                 "ticker",
                 "name",
                 "setup",
+                "score_view",
+                "score_band",
+                "recent_hit_rate_20d",
+                "recent_target_rate_5d",
                 "regime",
                 "regime_delta",
                 "learning_delta",
+                "rs_score",
+                "atr_pct",
                 "entry_price",
                 "stop_loss",
                 "volume_score",
@@ -866,6 +1247,7 @@ def render_buy_now_panel() -> None:
         currency_columns=["entry_price", "stop_loss"],
         column_config=_candidate_column_config(),
     )
+    _render_manual_tracking_quick_add(momentum_board, source_label="급등후보보드", key_prefix="momentum_board")
 
     if not st.session_state.portfolio.empty:
         portfolio_scores: list[int] = []
@@ -1019,6 +1401,8 @@ def render_realtime_tab() -> None:
     interval = str(st.session_state.realtime_settings["interval"])
     min_score = int(st.session_state.realtime_settings["min_score"])
     learning_adjustments, _ = get_learning_state()
+    _, _, _, _, pattern_stats = get_tracking_state()
+    pattern_lookup = _build_pattern_lookup(pattern_stats)
     us_regime = classify_market_regime("US")
     kr_regime = classify_market_regime("KR")
 
@@ -1044,6 +1428,8 @@ def render_realtime_tab() -> None:
         min_score=min_score,
         learning_adjustments=learning_adjustments,
     )
+    us_scan = _enrich_recommendation_frame(us_scan, scan_type="realtime_scan", market="US", pattern_lookup=pattern_lookup)
+    kr_scan = _enrich_recommendation_frame(kr_scan, scan_type="realtime_scan", market="KR", pattern_lookup=pattern_lookup)
 
     us_tab, kr_tab = st.tabs(["미국", "한국"])
     with us_tab:
@@ -1051,14 +1437,66 @@ def render_realtime_tab() -> None:
         if us_scan.empty:
             st.info("실시간 조건을 만족한 미국 후보가 없습니다.")
         else:
-            _show_table(us_scan, currency_columns=["current_price"], default_market="US", column_config=_candidate_column_config())
+            us_view = us_scan[
+                [
+                    "ticker",
+                    "name",
+                    "setup",
+                    "score_view",
+                    "score_band",
+                    "recent_hit_rate_20d",
+                    "recent_target_rate_5d",
+                    "score",
+                    "current_price",
+                    "regime",
+                    "regime_delta",
+                    "learning_delta",
+                    "rs_score",
+                    "atr_pct",
+                    "volume_ratio",
+                    "reason",
+                ]
+            ]
+            _show_table(
+                us_view,
+                currency_columns=["current_price"],
+                default_market="US",
+                column_config=_candidate_column_config(),
+            )
+            _render_manual_tracking_quick_add(us_scan, source_label="실시간", key_prefix="realtime_us", default_market="US")
 
     with kr_tab:
         st.caption(f"장세: {kr_regime.regime} / {kr_regime.note}")
         if kr_scan.empty:
             st.info("실시간 조건을 만족한 한국 후보가 없습니다.")
         else:
-            _show_table(kr_scan, currency_columns=["current_price"], default_market="KR", column_config=_candidate_column_config())
+            kr_view = kr_scan[
+                [
+                    "ticker",
+                    "name",
+                    "setup",
+                    "score_view",
+                    "score_band",
+                    "recent_hit_rate_20d",
+                    "recent_target_rate_5d",
+                    "score",
+                    "current_price",
+                    "regime",
+                    "regime_delta",
+                    "learning_delta",
+                    "rs_score",
+                    "atr_pct",
+                    "volume_ratio",
+                    "reason",
+                ]
+            ]
+            _show_table(
+                kr_view,
+                currency_columns=["current_price"],
+                default_market="KR",
+                column_config=_candidate_column_config(),
+            )
+            _render_manual_tracking_quick_add(kr_scan, source_label="실시간", key_prefix="realtime_kr", default_market="KR")
 
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
     if combined.empty:
@@ -1271,6 +1709,97 @@ def render_tracking_tab() -> None:
             _show_table(kr_compounders, currency_columns=["current_price"], default_market="KR", column_config=_candidate_column_config())
 
 
+def render_manual_tracking_tab() -> None:
+    st.subheader("관심 추적")
+    st.caption("추천 후보 중에서 네가 직접 고른 종목만 따로 저장해두고, 그 시점부터 이후 흐름을 별도로 봅니다.")
+
+    pool = _build_manual_tracking_pool()
+    tracked = load_manual_tracking()
+    detail, _, _, _, _ = get_tracking_state()
+    manual_detail = detail[detail["scan_type"] == "manual_track"].copy() if not detail.empty else pd.DataFrame()
+
+    st.markdown("#### 추적 추가")
+    if pool.empty:
+        st.info("지금 추가할 수 있는 추천 후보가 없습니다.")
+    else:
+        option_map = {
+            f"{row['source']} | {row['market']} | {row['ticker']} | {row['name']}": row
+            for _, row in pool.iterrows()
+        }
+        selected_label = st.selectbox("추천 후보에서 고르기", options=list(option_map.keys()))
+        memo = st.text_input("메모", placeholder="왜 관심 있는지 간단히 남겨도 됩니다.")
+        if st.button("관심 추적에 추가", use_container_width=True):
+            selected = option_map[selected_label]
+            row_dict = selected.to_dict()
+            row_dict["memo"] = memo.strip()
+            append_manual_tracking(row_dict)
+            append_scan_history("manual_track", str(selected["market"]), pd.DataFrame([row_dict]))
+            st.success(f"{selected['ticker']}를 관심 추적에 추가했습니다.")
+            st.rerun()
+
+    st.markdown("#### 현재 관심 종목")
+    if tracked.empty:
+        st.info("아직 직접 고른 관심 종목이 없습니다.")
+    else:
+        tracked_view = tracked.copy()
+        if not manual_detail.empty:
+            latest_manual = (
+                manual_detail.sort_values(by="saved_at", ascending=False)
+                .drop_duplicates(subset=["market", "ticker"], keep="first")
+                [
+                    [
+                        "market",
+                        "ticker",
+                        "ret_3d_pct",
+                        "ret_5d_pct",
+                        "ret_20d_pct",
+                        "path_5d",
+                        "path_20d",
+                    ]
+                ]
+            )
+            tracked_view = tracked_view.merge(latest_manual, on=["market", "ticker"], how="left")
+        tracked_view["score_view"] = tracked_view["score"].apply(lambda value: _score_view(float(value)) if str(value) != "" else "")
+        tracked_view["recent_hit_rate_20d"] = 0.0
+        tracked_view["recent_target_rate_5d"] = 0.0
+        _show_table(
+            tracked_view[
+                [
+                    "market",
+                    "ticker",
+                    "name",
+                    "source",
+                    "setup",
+                    "score_view",
+                    "current_price",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "ret_3d_pct",
+                    "ret_5d_pct",
+                    "ret_20d_pct",
+                    "path_5d",
+                    "path_20d",
+                    "memo",
+                    "created_at",
+                ]
+            ],
+            datetime_columns=["created_at"],
+            currency_columns=["current_price", "entry_price", "stop_loss", "target_1"],
+            column_config=_manual_tracking_column_config(),
+        )
+
+        removable = st.selectbox(
+            "삭제할 관심 종목",
+            options=[""] + [f"{row['tracking_id']} | {row['market']} | {row['ticker']}" for _, row in tracked.iterrows()],
+        )
+        if removable and st.button("관심 추적에서 제거", use_container_width=True):
+            tracking_id = removable.split("|")[0].strip()
+            remove_manual_tracking(tracking_id)
+            st.success("관심 추적 종목을 제거했습니다.")
+            st.rerun()
+
+
 def render_strategy_profiles_tab() -> None:
     st.subheader("전략별 추천")
     st.caption("안정형 적립, 우량 배당, 고위험 성장으로 성격을 나눠서 장기적으로 모아갈 후보를 봅니다.")
@@ -1360,6 +1889,8 @@ def render_short_term_trade_tab() -> None:
     interval = str(st.session_state.realtime_settings["interval"])
     min_score = max(60, int(st.session_state.realtime_settings["min_score"]))
     learning_adjustments, _ = get_learning_state()
+    _, _, _, _, pattern_stats = get_tracking_state()
+    pattern_lookup = _build_pattern_lookup(pattern_stats)
     us_regime = classify_market_regime("US")
     kr_regime = classify_market_regime("KR")
 
@@ -1391,6 +1922,10 @@ def render_short_term_trade_tab() -> None:
         min_score=60,
         learning_adjustments=learning_adjustments,
     )
+    us_trades = _enrich_recommendation_frame(us_trades, scan_type="short_term_trade", market="US", pattern_lookup=pattern_lookup)
+    kr_trades = _enrich_recommendation_frame(kr_trades, scan_type="short_term_trade", market="KR", pattern_lookup=pattern_lookup)
+    us_high_risk = _enrich_recommendation_frame(us_high_risk, scan_type="high_risk_trade", market="US", pattern_lookup=pattern_lookup)
+    kr_high_risk = _enrich_recommendation_frame(kr_high_risk, scan_type="high_risk_trade", market="KR", pattern_lookup=pattern_lookup)
 
     combined = pd.concat(
         [
@@ -1421,23 +1956,70 @@ def render_short_term_trade_tab() -> None:
             if us_trades.empty:
                 st.info("미국 일반 단타 후보가 없습니다.")
             else:
+                us_normal_view = us_trades[
+                    [
+                        "ticker",
+                        "name",
+                        "setup",
+                        "score_view",
+                        "score_band",
+                        "recent_hit_rate_20d",
+                        "recent_target_rate_5d",
+                        "score",
+                        "entry_price",
+                        "stop_loss",
+                        "target_1",
+                        "target_2",
+                        "atr_pct",
+                        "rs_score",
+                        "risk_reward_1",
+                        "regime",
+                        "learning_delta",
+                        "reason",
+                    ]
+                ]
                 _show_table(
-                    us_trades,
+                    us_normal_view,
                     currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="US",
                     column_config=_trade_column_config(),
                 )
+                _render_manual_tracking_quick_add(us_trades, source_label="일반단타", key_prefix="short_trade_us", default_market="US")
         with risky_tab:
             if us_high_risk.empty:
                 st.info("미국 고위험 단타 후보가 없습니다.")
             else:
                 st.warning("고위험 단타는 변동성이 매우 크니 소액/짧게 보는 전제가 필요합니다.")
+                us_risky_view = us_high_risk[
+                    [
+                        "ticker",
+                        "name",
+                        "risk_level",
+                        "setup",
+                        "score_view",
+                        "score_band",
+                        "recent_hit_rate_20d",
+                        "recent_target_rate_5d",
+                        "score",
+                        "entry_price",
+                        "stop_loss",
+                        "target_1",
+                        "target_2",
+                        "atr_pct",
+                        "rs_score",
+                        "risk_reward_1",
+                        "regime",
+                        "learning_delta",
+                        "reason",
+                    ]
+                ]
                 _show_table(
-                    us_high_risk,
+                    us_risky_view,
                     currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="US",
                     column_config=_trade_column_config(),
                 )
+                _render_manual_tracking_quick_add(us_high_risk, source_label="고위험단타", key_prefix="high_risk_us", default_market="US")
     with kr_tab:
         st.caption(f"장세: {kr_regime.regime} / {kr_regime.note}")
         normal_tab, risky_tab = st.tabs(["일반 단타", "고위험 단타"])
@@ -1445,23 +2027,70 @@ def render_short_term_trade_tab() -> None:
             if kr_trades.empty:
                 st.info("한국 일반 단타 후보가 없습니다.")
             else:
+                kr_normal_view = kr_trades[
+                    [
+                        "ticker",
+                        "name",
+                        "setup",
+                        "score_view",
+                        "score_band",
+                        "recent_hit_rate_20d",
+                        "recent_target_rate_5d",
+                        "score",
+                        "entry_price",
+                        "stop_loss",
+                        "target_1",
+                        "target_2",
+                        "atr_pct",
+                        "rs_score",
+                        "risk_reward_1",
+                        "regime",
+                        "learning_delta",
+                        "reason",
+                    ]
+                ]
                 _show_table(
-                    kr_trades,
+                    kr_normal_view,
                     currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="KR",
                     column_config=_trade_column_config(),
                 )
+                _render_manual_tracking_quick_add(kr_trades, source_label="일반단타", key_prefix="short_trade_kr", default_market="KR")
         with risky_tab:
             if kr_high_risk.empty:
                 st.info("한국 고위험 단타 후보가 없습니다.")
             else:
                 st.warning("고위험 단타는 급등과 급락이 모두 빠르니 손절 기준을 더 엄격하게 봐야 합니다.")
+                kr_risky_view = kr_high_risk[
+                    [
+                        "ticker",
+                        "name",
+                        "risk_level",
+                        "setup",
+                        "score_view",
+                        "score_band",
+                        "recent_hit_rate_20d",
+                        "recent_target_rate_5d",
+                        "score",
+                        "entry_price",
+                        "stop_loss",
+                        "target_1",
+                        "target_2",
+                        "atr_pct",
+                        "rs_score",
+                        "risk_reward_1",
+                        "regime",
+                        "learning_delta",
+                        "reason",
+                    ]
+                ]
                 _show_table(
-                    kr_high_risk,
+                    kr_risky_view,
                     currency_columns=["entry_price", "stop_loss", "target_1", "target_2"],
                     default_market="KR",
                     column_config=_trade_column_config(),
                 )
+                _render_manual_tracking_quick_add(kr_high_risk, source_label="고위험단타", key_prefix="high_risk_kr", default_market="KR")
 
     if not combined.empty:
         st.markdown("#### 단타 운용 원칙")
@@ -1472,13 +2101,14 @@ def render_short_term_trade_tab() -> None:
 
 def main() -> None:
     init_state()
+    _inject_ui_style()
     st.title("Stock Decision Helper")
     st.caption("한국/미국 주식을 함께 보며 보유 종목 관리와 간단한 추천 액션을 확인하는 1차 MVP입니다.")
 
     _, ticker = render_sidebar()
     page = st.radio(
         "화면 선택",
-        ["종목 분석", "보유 종목", "오늘 추천", "전략별 추천", "배당주", "단타", "자동 후보군", "추적", "실시간", "백테스트", "후보군 관리"],
+        ["종목 분석", "보유 종목", "오늘 추천", "전략별 추천", "배당주", "단타", "관심 추적", "자동 후보군", "추적", "실시간", "백테스트", "후보군 관리"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1505,6 +2135,8 @@ def main() -> None:
         render_dividend_tab()
     elif page == "단타":
         render_short_term_trade_tab()
+    elif page == "관심 추적":
+        render_manual_tracking_tab()
     elif page == "자동 후보군":
         render_auto_candidates_tab()
     elif page == "추적":

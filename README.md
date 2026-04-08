@@ -1,88 +1,78 @@
-# Stock Decision Helper MVP
+# Stock Decision Helper
 
-한국/미국 주식을 함께 조회하고, 보유 종목 기준으로 간단한 매수/매도 판단을 보여주는 Streamlit 기반 MVP입니다.
+한국/미국 주식을 함께 보면서 보유 종목 관리, 추천 후보 확인, 단타 플랜, 배당주 분석, 자동 후보 추적까지 한 번에 보는 Streamlit 기반 개인용 투자 보조 앱입니다.
 
-## 기능
+## 빠른 실행
 
-- 미국/한국 종목 가격 조회
-- 이동평균, RSI, MACD 계산
-- 보유 수량과 평균 단가 입력
-- 평가손익 계산
-- `홀드`, `일부매수`, `일부매도`, `관망` 추천
-- 일부매수/일부매도 비중 힌트
-- 추천 사유 표시
-- 미국/한국 대표 종목군 대상 오늘 매수 후보 스캐너
-- 보유 종목보다 강한 후보 비교
-- 보유 종목 로컬 저장/불러오기
-- CSV 보유 종목 업로드 및 샘플 다운로드
-- 추천 후보군 직접 편집 및 저장
-- 추천 점수 기준과 상위 표시 개수 조절
-- 점수 기반 간단 백테스트 화면
-- 추천 종목별 세부 점수와 급등 후보 보드
-- 분봉 기반 실시간 급등주 스캐너
-- 위험/성장/배당/집중도 기반 포트폴리오 분석
-- 월간/주간/일간/내일 급등 후보 자동 후보군
-- 후보군 스냅샷 누적 저장
-- 자동 후보 추적 성과판
-- 장기 복리형 후보 스크리너
-
-## 빠른 시작
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-파이썬 경로를 직접 써야 하면:
+가장 간단한 실행:
 
 ```powershell
 & "C:\Users\njwjs\AppData\Local\Programs\Python\Python313\python.exe" -m streamlit run app.py
 ```
 
-## 한국 종목 입력 예시
-
-- 삼성전자: `005930.KS`
-- SK하이닉스: `000660.KS`
-- NAVER: `035420.KS`
-
-## 프로젝트 구조
-
-```text
-app.py
-data/
-src/
-  backtest/
-  data/
-  indicators/
-  portfolio/
-  storage/
-  strategy/
-  ui/
-```
-
-## Git 업로드 전 참고
-
-- `.venv`, `__pycache__`, `.tmp`는 Git에서 제외합니다.
-- `data/*.json` 같은 로컬 누적 데이터는 개인 실행 기록이라 Git에서 제외합니다.
-- 회사 서버에서 돌릴 때는 서버 쪽에서 새로 누적되도록 두는 편이 깔끔합니다.
-
-## 회사 서버 실행 메모
+가상환경으로 실행:
 
 ```powershell
-git clone <your-repo-url>
-cd 주식
 python -m venv .venv
-.venv\Scripts\activate
+& ".\.venv\Scripts\Activate.ps1"
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+실행 후 브라우저에서 `http://localhost:8501` 을 열면 됩니다.
+
+## 주요 기능
+
+- 종목 분석: 단일 종목 차트, 지표, 현재 판단 확인
+- 보유 종목: 포트폴리오 입력, 저장, 분석, 리밸런싱 제안
+- 오늘 추천: 오늘 강한 후보와 급등 후보 보드 확인
+- 전략별 추천: 안정형, 배당형, 성장형 후보 확인
+- 배당주: 미국/한국 배당 후보, 배당 성장, 배당락일, 모아가기 구간 확인
+- 단타: 일반 단타와 고위험 단타 분리 확인
+- 관심 추적: 직접 골라둔 종목만 따로 추적
+- 자동 후보군: 월간, 주간, 일간, 내일 후보 자동 생성
+- 추적: 추천 후보의 이후 성과, 목표 도달, 손절 도달 추적
+- 실시간: 분봉 기반 장중 후보 확인
+- 백테스트: 점수 로직 기반 간단 백테스트
+- 후보군 관리: 미국/한국 관찰 후보 직접 편집
+
+## 파일 안내
+
+- [상세 한국어 매뉴얼](C:\Users\njwjs\Desktop\개발\주식\MANUAL_KO.md)
+- 실행 파일: [app.py](C:\Users\njwjs\Desktop\개발\주식\app.py)
+- 저장 폴더: [data](C:\Users\njwjs\Desktop\개발\주식\data)
+
+## 저장 방식
+
+현재는 로컬 JSON 저장입니다.
+
+- 포트폴리오 저장
+- 후보군 저장
+- 추천 스냅샷 저장
+- 학습용 피처 로그 저장
+- 관심 추적 저장
+
+즉 혼자 쓰는 환경에 맞춘 가벼운 구조입니다.
+
+## Git 업로드 참고
+
+다음 항목은 저장소에서 제외됩니다.
+
+- `.venv`
+- `__pycache__`
+- `.tmp`
+- `data/*.json`
+- `data/*.db`
+
+코드와 구조만 GitHub에 올리고, 누적 데이터는 실행 환경에서 새로 쌓는 방식입니다.
+
+## 회사 서버 실행 예시
+
+```powershell
+git clone https://github.com/hansol07/money.git
+cd money
+python -m venv .venv
+& ".\.venv\Scripts\Activate.ps1"
 pip install -r requirements.txt
 streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
-
-## 다음 확장 포인트
-
-- PostgreSQL 연동
-- 사용자별 포트폴리오 저장
-- 전 종목 기반 실시간 급등주 스캐너
-- 텔레그램/디스코드 알림
-- 백테스트 엔진 고도화

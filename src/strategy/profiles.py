@@ -77,6 +77,9 @@ def _growth_score(data: pd.DataFrame) -> tuple[int, list[str], float]:
     if latest["Close"] > latest["ma20"] > latest["ma60"] > latest["ma120"]:
         score += 28
         reasons.append("위로 정렬된 강한 성장 흐름입니다.")
+    if latest["rs_score"] >= 15:
+        score += 14
+        reasons.append("상대강도가 높아 시장 안에서 더 강한 편입니다.")
     if latest["return_60d"] > 18:
         score += 24
         reasons.append("최근 두 달 상승 속도가 빠릅니다.")
@@ -98,30 +101,33 @@ def build_strategy_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
     growth_rows: list[dict[str, object]] = []
 
     for item in get_universe(market):
-        data = get_stock_data(item["ticker"])
-        if data.empty or len(data) < 180:
+        try:
+            data = get_stock_data(item["ticker"])
+            if data.empty or len(data) < 180:
+                continue
+
+            latest = data.iloc[-1]
+            dividend_yield = float(get_stock_dividend_yield(item["ticker"]))
+            stable_score, stable_reasons, volatility, drawdown = _stable_score(data, dividend_yield)
+            dividend_score, dividend_reasons = _dividend_score(data, dividend_yield)
+            growth_score, growth_reasons, annual_return = _growth_score(data)
+
+            base = {
+                "ticker": item["ticker"],
+                "name": item["name"],
+                "current_price": round(float(latest["Close"]), 2),
+                "dividend_yield_pct": round(dividend_yield, 2),
+                "volatility_pct": round(volatility, 2),
+                "drawdown_pct": round(drawdown, 2),
+                "return_60d_pct": round(float(latest["return_60d"]), 2),
+                "return_1y_pct": round(annual_return, 2),
+            }
+
+            stable_rows.append({**base, "score": stable_score, "bucket": "안정형 적립", "reason": " / ".join(stable_reasons[:3])})
+            dividend_rows.append({**base, "score": dividend_score, "bucket": "우량 배당", "reason": " / ".join(dividend_reasons[:3])})
+            growth_rows.append({**base, "score": growth_score, "bucket": "고위험 성장", "reason": " / ".join(growth_reasons[:3])})
+        except Exception:
             continue
-
-        latest = data.iloc[-1]
-        dividend_yield = float(get_stock_dividend_yield(item["ticker"]))
-        stable_score, stable_reasons, volatility, drawdown = _stable_score(data, dividend_yield)
-        dividend_score, dividend_reasons = _dividend_score(data, dividend_yield)
-        growth_score, growth_reasons, annual_return = _growth_score(data)
-
-        base = {
-            "ticker": item["ticker"],
-            "name": item["name"],
-            "current_price": round(float(latest["Close"]), 2),
-            "dividend_yield_pct": round(dividend_yield, 2),
-            "volatility_pct": round(volatility, 2),
-            "drawdown_pct": round(drawdown, 2),
-            "return_60d_pct": round(float(latest["return_60d"]), 2),
-            "return_1y_pct": round(annual_return, 2),
-        }
-
-        stable_rows.append({**base, "score": stable_score, "bucket": "안정형 적립", "reason": " / ".join(stable_reasons[:3])})
-        dividend_rows.append({**base, "score": dividend_score, "bucket": "우량 배당", "reason": " / ".join(dividend_reasons[:3])})
-        growth_rows.append({**base, "score": growth_score, "bucket": "고위험 성장", "reason": " / ".join(growth_reasons[:3])})
 
     def _sort_frame(rows: list[dict[str, object]], sort_cols: list[str]) -> pd.DataFrame:
         if not rows:
@@ -158,7 +164,8 @@ def build_short_term_trade_candidates(
             recent_low = float(intraday["session_low_20"].iloc[-2])
             entry_price = max(float(intra_latest["Close"]), recent_high)
             stop_loss = min(float(intra_latest["vwap_proxy"]), recent_low)
-            risk_per_share = max(entry_price - stop_loss, entry_price * 0.008)
+            atr = float(daily_latest.get("atr14", 0) or 0)
+            risk_per_share = max(entry_price - stop_loss, atr, entry_price * 0.008)
             target_1 = entry_price + risk_per_share * 1.5
             target_2 = entry_price + risk_per_share * 2.5
 
@@ -220,6 +227,8 @@ def build_short_term_trade_candidates(
                     "target_2": round(target_2, 2),
                     "short_return_pct": round(float(intra_latest["short_return_pct"]), 2),
                     "volume_ratio": round(float(intra_latest["volume_ratio"]), 2),
+                    "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
+                    "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
                     "risk_reward_1": round((target_1 - entry_price) / max(entry_price - stop_loss, 0.01), 2),
                     "exit_rule": exit_rule,
                     "regime": regime.regime,
@@ -244,6 +253,8 @@ def build_short_term_trade_candidates(
                 "target_2",
                 "short_return_pct",
                 "volume_ratio",
+                "atr_pct",
+                "rs_score",
                 "risk_reward_1",
                 "regime",
                 "regime_delta",
@@ -285,7 +296,8 @@ def build_high_risk_trade_candidates(
             if stop_loss >= entry_price:
                 stop_loss = entry_price * 0.95
 
-            risk_per_share = max(entry_price - stop_loss, entry_price * 0.015)
+            atr = float(daily_latest.get("atr14", 0) or 0)
+            risk_per_share = max(entry_price - stop_loss, atr, entry_price * 0.015)
             target_1 = entry_price + risk_per_share * 2.0
             target_2 = entry_price + risk_per_share * 3.5
 
@@ -340,6 +352,8 @@ def build_high_risk_trade_candidates(
                     "target_2": round(target_2, 2),
                     "short_return_pct": round(float(intra_latest["short_return_pct"]), 2),
                     "volume_ratio": round(float(intra_latest["volume_ratio"]), 2),
+                    "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
+                    "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
                     "risk_reward_1": round((target_1 - entry_price) / max(entry_price - stop_loss, 0.01), 2),
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
@@ -365,6 +379,8 @@ def build_high_risk_trade_candidates(
                 "target_2",
                 "short_return_pct",
                 "volume_ratio",
+                "atr_pct",
+                "rs_score",
                 "risk_reward_1",
                 "regime",
                 "regime_delta",

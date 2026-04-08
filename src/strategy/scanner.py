@@ -51,12 +51,18 @@ def _build_candidate_profile(data: pd.DataFrame) -> CandidateProfile:
     if latest["return_20d"] >= 8:
         momentum_score += 8
         reasons.append("최근 흐름이 다른 종목보다 강합니다.")
+    if latest["rs_score"] >= 12:
+        momentum_score += 10
+        reasons.append("상대강도가 높아 주도주 성격이 있습니다.")
     if latest["Close"] >= data["Close"].tail(60).max() * 0.97:
         breakout_score += 12
         reasons.append("전고점 근처라 돌파를 볼 수 있습니다.")
     elif latest["Close"] >= data["Close"].tail(20).max() * 0.98:
         breakout_score += 6
         reasons.append("단기 고점 근처라 한 번 더 뛸 수 있습니다.")
+    if latest["from_52w_high_pct"] >= -8:
+        breakout_score += 8
+        reasons.append("52주 고점 근처라 강한 종목군에 가깝습니다.")
 
     setup = "눌림목"
     if breakout_score >= 10 and volume_score >= 8:
@@ -79,14 +85,14 @@ def _build_candidate_profile(data: pd.DataFrame) -> CandidateProfile:
 def _build_trade_plan(data: pd.DataFrame) -> tuple[float, float, float]:
     latest = data.iloc[-1]
     recent_high = float(data["High"].tail(20).max())
-    recent_low = float(data["Low"].tail(20).min())
     entry_price = max(float(latest["Close"]), recent_high * 0.995)
-    stop_loss = min(float(latest["ma20"]), recent_low * 1.01)
+    atr = float(latest.get("atr14", 0) or 0)
+    stop_loss = max(float(latest["Close"]) - atr * 1.5, float(latest["ma20"]))
 
     if stop_loss >= entry_price:
         stop_loss = entry_price * 0.97
 
-    risk_per_share = max(entry_price - stop_loss, entry_price * 0.02)
+    risk_per_share = max(entry_price - stop_loss, atr, entry_price * 0.02)
     target_1 = entry_price + risk_per_share * 1.8
     return round(entry_price, 2), round(stop_loss, 2), round(target_1, 2)
 
@@ -133,70 +139,76 @@ def scan_market(
 
     candidates = universe if universe is not None else get_universe(market)
     for item in candidates:
-        data = get_stock_data(item["ticker"])
-        if data.empty:
-            continue
-        analyzed = analyze_position(
-            data=data,
-            position=PositionInput(
-                ticker=item["ticker"],
-                quantity=0,
-                avg_price=0,
-                cash_budget=0,
-                target_weight=0,
-            ),
-        )
-        profile = _build_candidate_profile(data)
-        bonus = profile.trend_score + profile.momentum_score + profile.volume_score + profile.breakout_score
-        base_score = max(0, min(100, analyzed.score + bonus + regime.adjustment))
-        adjusted_score, learning_delta, learning_note = apply_learning_adjustment(
-            base_score=base_score,
-            scan_type="today_scan",
-            market=market,
-            setup=profile.setup,
-            adjustments=learning_adjustments,
-        )
-        analyzed.score = adjusted_score
-
-        if analyzed.score < min_score:
-            continue
-
-        if analyzed.score >= 80:
-            analyzed.action = "오늘매수후보"
-        elif analyzed.score >= 68:
-            analyzed.action = "관심후보"
-        else:
-            analyzed.action = "보류"
-
-        latest = data.iloc[-1]
-        entry_price, stop_loss, target_1 = _build_trade_plan(data)
-        rows.append(
-            {
-                "ticker": item["ticker"],
-                "name": item["name"],
-                "action": analyzed.action,
-                "setup": profile.setup,
-                "score": analyzed.score,
-                "current_price": round(analyzed.current_price, 2),
-                "trend_score": profile.trend_score,
-                "momentum_score": profile.momentum_score,
-                "volume_score": profile.volume_score,
-                "breakout_score": profile.breakout_score,
-                "volume_ratio": round(float(latest["volume_ratio"]), 2),
-                "return_20d": round(float(latest["return_20d"]), 2),
-                "entry_price": entry_price,
-                "stop_loss": stop_loss,
-                "target_1": target_1,
-                "regime": regime.regime,
-                "regime_delta": regime.adjustment,
-                "learning_delta": learning_delta,
-                "reason": " / ".join(
-                    ([regime.note] if regime.note else [])
-                    + ([learning_note] if learning_note else [])
-                    + (profile.reasons + analyzed.reasons)[:4]
+        try:
+            data = get_stock_data(item["ticker"])
+            if data.empty:
+                continue
+            analyzed = analyze_position(
+                data=data,
+                position=PositionInput(
+                    ticker=item["ticker"],
+                    quantity=0,
+                    avg_price=0,
+                    cash_budget=0,
+                    target_weight=0,
                 ),
-            }
-        )
+            )
+            profile = _build_candidate_profile(data)
+            bonus = profile.trend_score + profile.momentum_score + profile.volume_score + profile.breakout_score
+            base_score = max(0, min(100, analyzed.score + bonus + regime.adjustment))
+            adjusted_score, learning_delta, learning_note = apply_learning_adjustment(
+                base_score=base_score,
+                scan_type="today_scan",
+                market=market,
+                setup=profile.setup,
+                adjustments=learning_adjustments,
+            )
+            analyzed.score = adjusted_score
+
+            if analyzed.score < min_score:
+                continue
+
+            if analyzed.score >= 80:
+                analyzed.action = "오늘매수후보"
+            elif analyzed.score >= 68:
+                analyzed.action = "관심후보"
+            else:
+                analyzed.action = "보류"
+
+            latest = data.iloc[-1]
+            entry_price, stop_loss, target_1 = _build_trade_plan(data)
+            rows.append(
+                {
+                    "ticker": item["ticker"],
+                    "name": item["name"],
+                    "action": analyzed.action,
+                    "setup": profile.setup,
+                    "score": analyzed.score,
+                    "current_price": round(analyzed.current_price, 2),
+                    "trend_score": profile.trend_score,
+                    "momentum_score": profile.momentum_score,
+                    "volume_score": profile.volume_score,
+                    "breakout_score": profile.breakout_score,
+                    "volume_ratio": round(float(latest["volume_ratio"]), 2),
+                    "return_20d": round(float(latest["return_20d"]), 2),
+                    "rs_score": round(float(latest["rs_score"]), 2),
+                    "atr_pct": round(float(latest["atr_pct"]), 2),
+                    "from_52w_high_pct": round(float(latest["from_52w_high_pct"]), 2),
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "target_1": target_1,
+                    "regime": regime.regime,
+                    "regime_delta": regime.adjustment,
+                    "learning_delta": learning_delta,
+                    "reason": " / ".join(
+                        ([regime.note] if regime.note else [])
+                        + ([learning_note] if learning_note else [])
+                        + (profile.reasons + analyzed.reasons)[:4]
+                    ),
+                }
+            )
+        except Exception:
+            continue
 
     if not rows:
         return pd.DataFrame(
@@ -213,6 +225,9 @@ def scan_market(
                 "breakout_score",
                 "volume_ratio",
                 "return_20d",
+                "rs_score",
+                "atr_pct",
+                "from_52w_high_pct",
                 "entry_price",
                 "stop_loss",
                 "target_1",

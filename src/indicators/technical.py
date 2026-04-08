@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
+from ta.volatility import AverageTrueRange
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -19,8 +20,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     frame["macd"] = macd.macd()
     frame["macd_signal"] = macd.macd_signal()
     frame["macd_diff"] = macd.macd_diff()
+    atr = AverageTrueRange(high=frame["High"], low=frame["Low"], close=close, window=14)
+    frame["atr14"] = atr.average_true_range()
+    frame["atr_pct"] = frame["atr14"] / close * 100
 
     frame["return_20d"] = close.pct_change(20) * 100
     frame["return_60d"] = close.pct_change(60) * 100
+    frame["return_120d"] = close.pct_change(120) * 100
+    frame["return_252d"] = close.pct_change(252) * 100
+    frame["high_252"] = frame["High"].rolling(252).max()
+    frame["low_252"] = frame["Low"].rolling(252).min()
+    frame["from_52w_high_pct"] = (close / frame["high_252"] - 1) * 100
+    frame["from_52w_low_pct"] = (close / frame["low_252"] - 1) * 100
+    frame["rs_score"] = (
+        frame["return_20d"].fillna(0) * 0.35
+        + frame["return_60d"].fillna(0) * 0.35
+        + frame["return_120d"].fillna(0) * 0.2
+        + frame["return_252d"].fillna(0) * 0.1
+    )
     frame["volume_ratio"] = frame["Volume"] / frame["volume_ma20"]
     return frame.dropna().reset_index(drop=True)

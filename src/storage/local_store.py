@@ -13,6 +13,7 @@ PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 WATCHLIST_FILE = DATA_DIR / "watchlists.json"
 SCAN_HISTORY_FILE = DATA_DIR / "scan_history.json"
 FEATURE_LOG_FILE = DATA_DIR / "candidate_feature_log.json"
+MANUAL_TRACKING_FILE = DATA_DIR / "manual_tracking.json"
 
 
 def ensure_data_dir() -> None:
@@ -241,3 +242,67 @@ def load_feature_log() -> list[dict[str, object]]:
     if not FEATURE_LOG_FILE.exists():
         return []
     return json.loads(FEATURE_LOG_FILE.read_text(encoding="utf-8"))
+
+
+def load_manual_tracking() -> pd.DataFrame:
+    if not MANUAL_TRACKING_FILE.exists():
+        return pd.DataFrame(
+            columns=[
+                "tracking_id",
+                "created_at",
+                "market",
+                "ticker",
+                "name",
+                "source",
+                "setup",
+                "score",
+                "current_price",
+                "entry_price",
+                "stop_loss",
+                "target_1",
+                "memo",
+            ]
+        )
+    records = json.loads(MANUAL_TRACKING_FILE.read_text(encoding="utf-8"))
+    return pd.DataFrame(records)
+
+
+def save_manual_tracking(df: pd.DataFrame) -> None:
+    ensure_data_dir()
+    records = df.fillna("").to_dict("records")
+    MANUAL_TRACKING_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_manual_tracking(row: dict[str, object]) -> None:
+    current = load_manual_tracking()
+    tracking_id = str(row.get("tracking_id", "") or f"manual_{uuid4().hex[:8]}")
+    created_at = str(row.get("created_at", "") or pd.Timestamp.now(tz="Asia/Seoul").isoformat(timespec="seconds"))
+    payload = {
+        "tracking_id": tracking_id,
+        "created_at": created_at,
+        "market": row.get("market", ""),
+        "ticker": str(row.get("ticker", "")).strip().upper(),
+        "name": row.get("name", ""),
+        "source": row.get("source", ""),
+        "setup": row.get("setup", ""),
+        "score": row.get("score", ""),
+        "current_price": row.get("current_price", ""),
+        "entry_price": row.get("entry_price", ""),
+        "stop_loss": row.get("stop_loss", ""),
+        "target_1": row.get("target_1", ""),
+        "memo": row.get("memo", ""),
+    }
+    if current.empty:
+        updated = pd.DataFrame([payload])
+    else:
+        current = current[~((current["market"] == payload["market"]) & (current["ticker"] == payload["ticker"]))]
+        updated = pd.concat([current, pd.DataFrame([payload])], ignore_index=True)
+    save_manual_tracking(updated)
+
+
+def remove_manual_tracking(tracking_id: str) -> None:
+    current = load_manual_tracking()
+    if current.empty:
+        return
+    updated = current[current["tracking_id"] != tracking_id].reset_index(drop=True)
+    save_manual_tracking(updated)

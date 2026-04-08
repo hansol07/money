@@ -20,79 +20,82 @@ def scan_intraday_market(
     regime = classify_market_regime(market)
 
     for item in candidates:
-        data = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
-        if data.empty or len(data) < 25:
+        try:
+            data = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
+            if data.empty or len(data) < 25:
+                continue
+
+            latest = data.iloc[-1]
+            prev = data.iloc[-2]
+            score = 40
+            reasons: list[str] = []
+
+            if latest["volume_ratio"] >= 2.0:
+                score += 20
+                reasons.append("지금 거래량이 평소보다 확실히 많습니다.")
+            elif latest["volume_ratio"] >= 1.3:
+                score += 10
+                reasons.append("분봉 거래량이 평소보다 강합니다.")
+
+            if latest["short_return_pct"] >= 1.2:
+                score += 18
+                reasons.append("방금 올라가는 힘이 강합니다.")
+            elif latest["short_return_pct"] >= 0.5:
+                score += 8
+                reasons.append("짧은 흐름이 위로 살아 있습니다.")
+
+            recent_high = float(data["session_high_20"].iloc[-2])
+            if float(latest["Close"]) >= recent_high:
+                score += 18
+                reasons.append("방금 직전 고점을 넘었습니다.")
+
+            if float(latest["Close"]) > float(latest["vwap_proxy"]):
+                score += 12
+                reasons.append("장중 평균가 위라 흐름이 강한 편입니다.")
+
+            if float(latest["Close"]) > float(prev["Close"]):
+                score += 6
+
+            score = max(0, min(100, int(score + regime.adjustment)))
+            if score < min_score:
+                continue
+
+            if score >= 82:
+                setup = "장중돌파"
+            elif score >= 70:
+                setup = "급등감시"
+            else:
+                setup = "초기강세"
+
+            score, learning_delta, learning_note = apply_learning_adjustment(
+                base_score=score,
+                scan_type="realtime_scan",
+                market=market,
+                setup=setup,
+                adjustments=learning_adjustments,
+            )
+
+            if score < min_score:
+                continue
+
+            rows.append(
+                {
+                    "ticker": item["ticker"],
+                    "name": item["name"],
+                    "setup": setup,
+                    "score": score,
+                    "current_price": round(float(latest["Close"]), 2),
+                    "volume_ratio": round(float(latest["volume_ratio"]), 2),
+                    "short_return_pct": round(float(latest["short_return_pct"]), 2),
+                    "above_vwap": bool(float(latest["Close"]) > float(latest["vwap_proxy"])),
+                    "regime": regime.regime,
+                    "regime_delta": regime.adjustment,
+                    "learning_delta": learning_delta,
+                    "reason": " / ".join(([regime.note] if regime.note else []) + ([learning_note] if learning_note else []) + reasons[:4]),
+                }
+            )
+        except Exception:
             continue
-
-        latest = data.iloc[-1]
-        prev = data.iloc[-2]
-        score = 40
-        reasons: list[str] = []
-
-        if latest["volume_ratio"] >= 2.0:
-            score += 20
-            reasons.append("지금 거래량이 평소보다 확실히 많습니다.")
-        elif latest["volume_ratio"] >= 1.3:
-            score += 10
-            reasons.append("분봉 거래량이 평소보다 강합니다.")
-
-        if latest["short_return_pct"] >= 1.2:
-            score += 18
-            reasons.append("방금 올라가는 힘이 강합니다.")
-        elif latest["short_return_pct"] >= 0.5:
-            score += 8
-            reasons.append("짧은 흐름이 위로 살아 있습니다.")
-
-        recent_high = float(data["session_high_20"].iloc[-2])
-        if float(latest["Close"]) >= recent_high:
-            score += 18
-            reasons.append("방금 직전 고점을 넘었습니다.")
-
-        if float(latest["Close"]) > float(latest["vwap_proxy"]):
-            score += 12
-            reasons.append("장중 평균가 위라 흐름이 강한 편입니다.")
-
-        if float(latest["Close"]) > float(prev["Close"]):
-            score += 6
-
-        score = max(0, min(100, int(score + regime.adjustment)))
-        if score < min_score:
-            continue
-
-        if score >= 82:
-            setup = "장중돌파"
-        elif score >= 70:
-            setup = "급등감시"
-        else:
-            setup = "초기강세"
-
-        score, learning_delta, learning_note = apply_learning_adjustment(
-            base_score=score,
-            scan_type="realtime_scan",
-            market=market,
-            setup=setup,
-            adjustments=learning_adjustments,
-        )
-
-        if score < min_score:
-            continue
-
-        rows.append(
-            {
-                "ticker": item["ticker"],
-                "name": item["name"],
-                "setup": setup,
-                "score": score,
-                "current_price": round(float(latest["Close"]), 2),
-                "volume_ratio": round(float(latest["volume_ratio"]), 2),
-                "short_return_pct": round(float(latest["short_return_pct"]), 2),
-                "above_vwap": bool(float(latest["Close"]) > float(latest["vwap_proxy"])),
-                "regime": regime.regime,
-                "regime_delta": regime.adjustment,
-                "learning_delta": learning_delta,
-                "reason": " / ".join(([regime.note] if regime.note else []) + ([learning_note] if learning_note else []) + reasons[:4]),
-            }
-        )
 
     if not rows:
         return pd.DataFrame(
