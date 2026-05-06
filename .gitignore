@@ -8,7 +8,20 @@ data/*.json
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/universe_*.csv
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+data/yfinance_cache/
 !data/.gitkeep
+!data/cache.sqlite3
+!data/candidate_feature_log.json
+!data/scan_history.json
+!data/full_collection_state.json
+!data/portfolio.json
+!data/universe_US.csv
+!data/universe_KR.csv
 
 *.pyc
 *.pyo

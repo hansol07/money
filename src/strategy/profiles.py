@@ -1,11 +1,55 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pandas as pd
 
-from src.data.fetch import get_intraday_stock_data, get_stock_data, get_stock_dividend_yield
-from src.strategy.learning import apply_learning_adjustment, LearningAdjustment
+from src.data.fetch import (
+    get_intraday_stock_data,
+    is_recent_price_data,
+    get_stock_data,
+    get_stock_dividend_yield,
+    get_stock_event_summary,
+    get_stock_news_summary,
+)
+from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
-from src.strategy.universe import get_high_risk_universe, get_universe
+from src.strategy.universe import get_high_risk_universe, get_market_sweep_universe, get_universe
+
+
+ScanProgressCallback = Callable[[dict[str, object]], None]
+
+
+def _emit_progress(
+    callback: ScanProgressCallback | None,
+    *,
+    market: str,
+    scan_type: str,
+    done: int,
+    total: int,
+    ticker: str,
+    stage: str,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "market": market,
+                "scan_type": scan_type,
+                "done": done,
+                "total": total,
+                "ticker": ticker,
+                "stage": stage,
+            }
+        )
+    except Exception:
+        return
+
+
+def _with_diagnostics(frame: pd.DataFrame, diagnostics: dict[str, int]) -> pd.DataFrame:
+    frame.attrs["diagnostics"] = diagnostics
+    return frame
 
 
 def _volatility_pct(data: pd.DataFrame) -> float:
@@ -95,6 +139,49 @@ def _growth_score(data: pd.DataFrame) -> tuple[int, list[str], float]:
     return score, reasons, annual_return
 
 
+def _latest_float(data: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    if data.empty or column not in data.columns:
+        return default
+    value = pd.to_numeric(data[column].iloc[-1], errors="coerce")
+    return default if pd.isna(value) else float(value)
+
+
+def _passes_short_term_daily_prefilter(data: pd.DataFrame) -> bool:
+    if data.empty or len(data) < 80:
+        return False
+    close = _latest_float(data, "Close")
+    ma20 = _latest_float(data, "ma20")
+    ma60 = _latest_float(data, "ma60")
+    rsi = _latest_float(data, "rsi", 50.0)
+    return_20d = _latest_float(data, "return_20d")
+    rs_score = _latest_float(data, "rs_score")
+    volume_ratio = _latest_float(data, "volume_ratio", 1.0)
+    high_60 = float(pd.to_numeric(data["High"].tail(60), errors="coerce").max()) if "High" in data.columns else close
+
+    trend_ok = close > ma20 or (close > ma60 and return_20d > 0)
+    momentum_ok = return_20d >= 3 or rs_score >= 8 or close >= high_60 * 0.96
+    attention_ok = volume_ratio >= 1.05 or return_20d >= 6
+    rsi_ok = 35 <= rsi <= 82
+    return bool(trend_ok and momentum_ok and attention_ok and rsi_ok)
+
+
+def _passes_high_risk_daily_prefilter(data: pd.DataFrame) -> bool:
+    if data.empty or len(data) < 60:
+        return False
+    close = _latest_float(data, "Close")
+    ma20 = _latest_float(data, "ma20")
+    return_20d = _latest_float(data, "return_20d")
+    return_60d = _latest_float(data, "return_60d")
+    volume_ratio = _latest_float(data, "volume_ratio", 1.0)
+    atr_pct = _latest_float(data, "atr_pct")
+    rs_score = _latest_float(data, "rs_score")
+    return bool(
+        (close > ma20 and (return_20d >= 5 or rs_score >= 8))
+        or volume_ratio >= 1.25
+        or (atr_pct >= 4 and return_60d >= 8)
+    )
+
+
 def build_strategy_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFrame]:
     stable_rows: list[dict[str, object]] = []
     dividend_rows: list[dict[str, object]] = []
@@ -103,7 +190,7 @@ def build_strategy_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
     for item in get_universe(market):
         try:
             data = get_stock_data(item["ticker"])
-            if data.empty or len(data) < 180:
+            if data.empty or len(data) < 180 or not is_recent_price_data(data, max_age_days=3):
                 continue
 
             latest = data.iloc[-1]
@@ -146,20 +233,105 @@ def build_short_term_trade_candidates(
     top_n: int = 8,
     interval: str = "5m",
     min_score: int = 65,
+    universe: list[dict[str, str]] | None = None,
+    scan_limit: int | None = None,
+    progress_callback: ScanProgressCallback | None = None,
     learning_adjustments: dict[tuple[str, str, str], LearningAdjustment] | None = None,
+    event_adjustments: dict[str, ContextAdjustment] | None = None,
+    news_adjustments: dict[str, ContextAdjustment] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    fallback_rows: list[dict[str, object]] = []
     regime = classify_market_regime(market)
+    candidates = universe if universe is not None else get_market_sweep_universe(market)
+    if scan_limit is not None:
+        candidates = candidates[: max(1, int(scan_limit))]
+    diagnostics = {
+        "scanned": 0,
+        "daily_pass": 0,
+        "intraday_pass": 0,
+        "selected": 0,
+        "fallback_selected": 0,
+        "errors": 0,
+    }
 
-    for item in get_universe(market):
+    total = len(candidates)
+    for index, item in enumerate(candidates, start=1):
         try:
+            diagnostics["scanned"] += 1
+            _emit_progress(
+                progress_callback,
+                market=market,
+                scan_type="short_term_trade",
+                done=index,
+                total=total,
+                ticker=item["ticker"],
+                stage="일봉 선별",
+            )
             daily = get_stock_data(item["ticker"])
-            intraday = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
-            if daily.empty or intraday.empty or len(intraday) < 25:
+            if not is_recent_price_data(daily, max_age_days=3) or not _passes_short_term_daily_prefilter(daily):
                 continue
+            diagnostics["daily_pass"] += 1
+            daily_latest = daily.iloc[-1]
+            close = float(daily_latest.get("Close", 0) or 0)
+            atr = float(daily_latest.get("atr14", 0) or 0)
+            atr_floor = max(atr, close * 0.025)
+            daily_score = 45
+            daily_reasons: list[str] = ["분봉 확인 전 일봉 기준 예비 단타 후보입니다."]
+            if close > float(daily_latest.get("ma20", close) or close):
+                daily_score += 12
+                daily_reasons.append("20일선 위에서 버티고 있습니다.")
+            if float(daily_latest.get("return_20d", 0) or 0) >= 3:
+                daily_score += 10
+                daily_reasons.append("최근 20일 흐름이 플러스입니다.")
+            if float(daily_latest.get("rs_score", 0) or 0) >= 8:
+                daily_score += 8
+                daily_reasons.append("상대강도가 시장보다 나은 편입니다.")
+            if float(daily_latest.get("volume_ratio", 1) or 1) >= 1.05:
+                daily_score += 8
+                daily_reasons.append("일봉 거래량 관심이 붙었습니다.")
+            daily_score = min(100, max(0, int(daily_score + regime.adjustment)))
+            if close > 0 and daily_score >= max(45, min_score - 15):
+                fallback_rows.append(
+                    {
+                        "ticker": item["ticker"],
+                        "name": item["name"],
+                        "setup": "일봉예비",
+                        "score": daily_score,
+                        "entry_price": round(close, 2),
+                        "stop_loss": round(max(0.01, close - atr_floor * 1.2), 2),
+                        "target_1": round(close + atr_floor * 1.8, 2),
+                        "target_2": round(close + atr_floor * 2.8, 2),
+                        "short_return_pct": round(float(daily_latest.get("return_5d", 0) or 0), 2),
+                        "volume_ratio": round(float(daily_latest.get("volume_ratio", 1) or 1), 2),
+                        "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
+                        "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
+                        "risk_reward_1": 1.5,
+                        "exit_rule": "분봉 거래량 확인 전에는 소액 또는 관찰만",
+                        "regime": regime.regime,
+                        "regime_delta": regime.adjustment,
+                        "context_delta": 0,
+                        "event_risk": "",
+                        "event_note": "",
+                        "earnings_date": "",
+                        "ex_dividend_date": "",
+                        "news_bias": "중립",
+                        "news_score": 0,
+                        "news_count": 0,
+                        "learning_delta": 0,
+                        "data_basis": "일봉 예비",
+                        "reason": " / ".join(([regime.note] if regime.note else []) + daily_reasons[:4]),
+                    }
+                )
+            intraday = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
+            if daily.empty or intraday.empty or len(intraday) < 25 or not is_recent_price_data(intraday, max_age_days=1):
+                continue
+            diagnostics["intraday_pass"] += 1
 
             daily_latest = daily.iloc[-1]
             intra_latest = intraday.iloc[-1]
+            event_summary = get_stock_event_summary(item["ticker"])
+            news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
             recent_low = float(intraday["session_low_20"].iloc[-2])
             entry_price = max(float(intra_latest["Close"]), recent_high)
@@ -191,6 +363,22 @@ def build_short_term_trade_candidates(
             if 48 <= float(daily_latest["rsi"]) <= 72:
                 score += 8
 
+            event_risk = str(event_summary.get("event_risk", "") or "")
+            news_bias = str(news_summary.get("news_bias", "중립") or "중립")
+            news_score = int(news_summary.get("news_score", 0) or 0)
+            if event_risk == "높음":
+                score -= 8
+                reasons.append("가까운 일정이 있어 단타 변동성이 커질 수 있습니다.")
+            elif event_risk == "중간":
+                score -= 3
+
+            if news_bias == "긍정":
+                score += min(6, max(2, news_score * 2))
+                reasons.append("최근 뉴스 흐름이 우호적입니다.")
+            elif news_bias == "부정":
+                score -= min(6, max(2, abs(news_score) * 2))
+                reasons.append("최근 뉴스 흐름이 부담이라 짧게 보는 편이 좋습니다.")
+
             score = min(100, max(0, int(score + regime.adjustment)))
             if score < min_score:
                 continue
@@ -210,6 +398,13 @@ def build_short_term_trade_candidates(
                 market=market,
                 setup=setup,
                 adjustments=learning_adjustments,
+            )
+            score, context_delta, context_note = apply_context_adjustment(
+                base_score=score,
+                event_risk=event_risk,
+                news_bias=news_bias,
+                event_adjustments=event_adjustments,
+                news_adjustments=news_adjustments,
             )
 
             if score < min_score:
@@ -233,40 +428,74 @@ def build_short_term_trade_candidates(
                     "exit_rule": exit_rule,
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
+                    "context_delta": context_delta,
+                    "event_risk": event_risk,
+                    "event_note": str(event_summary.get("event_note", "")),
+                    "earnings_date": str(event_summary.get("earnings_date", "")),
+                    "ex_dividend_date": str(event_summary.get("ex_dividend_date", "")),
+                    "news_bias": news_bias,
+                    "news_score": news_score,
+                    "news_count": int(news_summary.get("news_count", 0) or 0),
                     "learning_delta": learning_delta,
-                    "reason": " / ".join(([regime.note] if regime.note else []) + ([learning_note] if learning_note else []) + reasons[:4]),
+                    "reason": " / ".join(
+                        ([regime.note] if regime.note else [])
+                        + ([context_note] if context_note else [])
+                        + ([learning_note] if learning_note else [])
+                        + reasons[:4]
+                    ),
                 }
             )
+            diagnostics["selected"] += 1
         except Exception:
+            diagnostics["errors"] += 1
             continue
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "name",
-                "setup",
-                "score",
-                "entry_price",
-                "stop_loss",
-                "target_1",
-                "target_2",
-                "short_return_pct",
-                "volume_ratio",
-                "atr_pct",
-                "rs_score",
-                "risk_reward_1",
-                "regime",
-                "regime_delta",
-                "learning_delta",
-                "exit_rule",
-                "reason",
-            ]
+        if fallback_rows:
+            fallback = pd.DataFrame(fallback_rows).sort_values(
+                by=["score", "volume_ratio", "short_return_pct"], ascending=[False, False, False]
+            ).head(top_n).reset_index(drop=True)
+            diagnostics["fallback_selected"] = len(fallback)
+            return _with_diagnostics(fallback, diagnostics)
+        return _with_diagnostics(
+            pd.DataFrame(
+                columns=[
+                    "ticker",
+                    "name",
+                    "setup",
+                    "score",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "target_2",
+                    "short_return_pct",
+                    "volume_ratio",
+                    "atr_pct",
+                    "rs_score",
+                    "risk_reward_1",
+                    "regime",
+                    "regime_delta",
+                    "context_delta",
+                    "event_risk",
+                    "event_note",
+                    "earnings_date",
+                    "ex_dividend_date",
+                    "news_bias",
+                    "news_score",
+                    "news_count",
+                    "learning_delta",
+                    "exit_rule",
+                    "data_basis",
+                    "reason",
+                ]
+            ),
+            diagnostics,
         )
 
-    return pd.DataFrame(rows).sort_values(
+    result = pd.DataFrame(rows).sort_values(
         by=["score", "volume_ratio", "short_return_pct"], ascending=[False, False, False]
     ).head(top_n).reset_index(drop=True)
+    return _with_diagnostics(result, diagnostics)
 
 
 def build_high_risk_trade_candidates(
@@ -274,20 +503,106 @@ def build_high_risk_trade_candidates(
     top_n: int = 8,
     interval: str = "5m",
     min_score: int = 60,
+    universe: list[dict[str, str]] | None = None,
+    scan_limit: int | None = None,
+    progress_callback: ScanProgressCallback | None = None,
     learning_adjustments: dict[tuple[str, str, str], LearningAdjustment] | None = None,
+    event_adjustments: dict[str, ContextAdjustment] | None = None,
+    news_adjustments: dict[str, ContextAdjustment] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    fallback_rows: list[dict[str, object]] = []
     regime = classify_market_regime(market)
+    candidates = universe if universe is not None else get_high_risk_universe(market)
+    if scan_limit is not None:
+        candidates = candidates[: max(1, int(scan_limit))]
+    diagnostics = {
+        "scanned": 0,
+        "daily_pass": 0,
+        "intraday_pass": 0,
+        "selected": 0,
+        "fallback_selected": 0,
+        "errors": 0,
+    }
 
-    for item in get_high_risk_universe(market):
+    total = len(candidates)
+    for index, item in enumerate(candidates, start=1):
         try:
+            diagnostics["scanned"] += 1
+            _emit_progress(
+                progress_callback,
+                market=market,
+                scan_type="high_risk_trade",
+                done=index,
+                total=total,
+                ticker=item["ticker"],
+                stage="고위험 일봉 선별",
+            )
             daily = get_stock_data(item["ticker"])
-            intraday = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
-            if daily.empty or intraday.empty or len(intraday) < 25:
+            if not is_recent_price_data(daily, max_age_days=3) or not _passes_high_risk_daily_prefilter(daily):
                 continue
+            diagnostics["daily_pass"] += 1
+            daily_latest = daily.iloc[-1]
+            close = float(daily_latest.get("Close", 0) or 0)
+            atr = float(daily_latest.get("atr14", 0) or 0)
+            atr_floor = max(atr, close * 0.04)
+            daily_score = 42
+            daily_reasons: list[str] = ["분봉 확인 전 고위험 일봉 예비 후보입니다."]
+            if float(daily_latest.get("return_20d", 0) or 0) >= 5:
+                daily_score += 12
+                daily_reasons.append("최근 상승 탄력이 있습니다.")
+            if float(daily_latest.get("volume_ratio", 1) or 1) >= 1.25:
+                daily_score += 12
+                daily_reasons.append("일봉 거래량이 늘었습니다.")
+            if float(daily_latest.get("atr_pct", 0) or 0) >= 4:
+                daily_score += 8
+                daily_reasons.append("변동성이 커 단타성 움직임이 나올 수 있습니다.")
+            if float(daily_latest.get("rs_score", 0) or 0) >= 8:
+                daily_score += 8
+                daily_reasons.append("시장 대비 상대강도가 있습니다.")
+            daily_score = min(100, max(0, int(daily_score + regime.adjustment)))
+            if close > 0 and daily_score >= max(42, min_score - 18):
+                fallback_rows.append(
+                    {
+                        "ticker": item["ticker"],
+                        "name": item["name"],
+                        "setup": "고위험일봉예비",
+                        "score": daily_score,
+                        "entry_price": round(close, 2),
+                        "stop_loss": round(max(0.01, close - atr_floor * 1.0), 2),
+                        "target_1": round(close + atr_floor * 2.0, 2),
+                        "target_2": round(close + atr_floor * 3.2, 2),
+                        "short_return_pct": round(float(daily_latest.get("return_5d", 0) or 0), 2),
+                        "volume_ratio": round(float(daily_latest.get("volume_ratio", 1) or 1), 2),
+                        "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
+                        "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
+                        "risk_reward_1": 2.0,
+                        "regime": regime.regime,
+                        "regime_delta": regime.adjustment,
+                        "context_delta": 0,
+                        "event_risk": "",
+                        "event_note": "",
+                        "earnings_date": "",
+                        "ex_dividend_date": "",
+                        "news_bias": "중립",
+                        "news_score": 0,
+                        "news_count": 0,
+                        "learning_delta": 0,
+                        "exit_rule": "분봉 확인 전에는 추격 금지, 관찰 우선",
+                        "risk_level": "높음",
+                        "data_basis": "일봉 예비",
+                        "reason": " / ".join(([regime.note] if regime.note else []) + daily_reasons[:4]),
+                    }
+                )
+            intraday = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
+            if daily.empty or intraday.empty or len(intraday) < 25 or not is_recent_price_data(intraday, max_age_days=1):
+                continue
+            diagnostics["intraday_pass"] += 1
 
             daily_latest = daily.iloc[-1]
             intra_latest = intraday.iloc[-1]
+            event_summary = get_stock_event_summary(item["ticker"])
+            news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
             recent_low = float(intraday["session_low_20"].iloc[-2])
 
@@ -328,6 +643,22 @@ def build_high_risk_trade_candidates(
             elif float(intra_latest["Close"]) > float(intra_latest["vwap_proxy"]):
                 setup = "고위험VWAP지지"
 
+            event_risk = str(event_summary.get("event_risk", "") or "")
+            news_bias = str(news_summary.get("news_bias", "중립") or "중립")
+            news_score = int(news_summary.get("news_score", 0) or 0)
+            if event_risk == "높음":
+                score -= 10
+                reasons.append("이벤트가 가까워 변동성이 과하게 커질 수 있습니다.")
+            elif event_risk == "중간":
+                score -= 4
+
+            if news_bias == "긍정":
+                score += min(7, max(2, news_score * 2))
+                reasons.append("최근 뉴스 흐름이 강세 쪽입니다.")
+            elif news_bias == "부정":
+                score -= min(7, max(2, abs(news_score) * 2))
+                reasons.append("최근 뉴스 흐름이 약세 쪽이라 주의가 필요합니다.")
+
             score = min(100, max(0, int(score + regime.adjustment)))
             score, learning_delta, learning_note = apply_learning_adjustment(
                 base_score=score,
@@ -335,6 +666,13 @@ def build_high_risk_trade_candidates(
                 market=market,
                 setup=setup,
                 adjustments=learning_adjustments,
+            )
+            score, context_delta, context_note = apply_context_adjustment(
+                base_score=score,
+                event_risk=event_risk,
+                news_bias=news_bias,
+                event_adjustments=event_adjustments,
+                news_adjustments=news_adjustments,
             )
 
             if score < min_score:
@@ -357,40 +695,74 @@ def build_high_risk_trade_candidates(
                     "risk_reward_1": round((target_1 - entry_price) / max(entry_price - stop_loss, 0.01), 2),
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
+                    "context_delta": context_delta,
+                    "event_risk": event_risk,
+                    "event_note": str(event_summary.get("event_note", "")),
+                    "earnings_date": str(event_summary.get("earnings_date", "")),
+                    "ex_dividend_date": str(event_summary.get("ex_dividend_date", "")),
+                    "news_bias": news_bias,
+                    "news_score": news_score,
+                    "news_count": int(news_summary.get("news_count", 0) or 0),
                     "learning_delta": learning_delta,
                     "exit_rule": exit_rule,
                     "risk_level": "매우높음",
-                    "reason": " / ".join(([regime.note] if regime.note else []) + ([learning_note] if learning_note else []) + reasons[:4]),
+                    "reason": " / ".join(
+                        ([regime.note] if regime.note else [])
+                        + ([context_note] if context_note else [])
+                        + ([learning_note] if learning_note else [])
+                        + reasons[:4]
+                    ),
                 }
             )
+            diagnostics["selected"] += 1
         except Exception:
+            diagnostics["errors"] += 1
             continue
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "name",
-                "setup",
-                "score",
-                "entry_price",
-                "stop_loss",
-                "target_1",
-                "target_2",
-                "short_return_pct",
-                "volume_ratio",
-                "atr_pct",
-                "rs_score",
-                "risk_reward_1",
-                "regime",
-                "regime_delta",
-                "learning_delta",
-                "exit_rule",
-                "risk_level",
-                "reason",
-            ]
+        if fallback_rows:
+            fallback = pd.DataFrame(fallback_rows).sort_values(
+                by=["score", "volume_ratio", "short_return_pct"], ascending=[False, False, False]
+            ).head(top_n).reset_index(drop=True)
+            diagnostics["fallback_selected"] = len(fallback)
+            return _with_diagnostics(fallback, diagnostics)
+        return _with_diagnostics(
+            pd.DataFrame(
+                columns=[
+                    "ticker",
+                    "name",
+                    "setup",
+                    "score",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "target_2",
+                    "short_return_pct",
+                    "volume_ratio",
+                    "atr_pct",
+                    "rs_score",
+                    "risk_reward_1",
+                    "regime",
+                    "regime_delta",
+                    "context_delta",
+                    "event_risk",
+                    "event_note",
+                    "earnings_date",
+                    "ex_dividend_date",
+                    "news_bias",
+                    "news_score",
+                    "news_count",
+                    "learning_delta",
+                    "exit_rule",
+                    "risk_level",
+                    "data_basis",
+                    "reason",
+                ]
+            ),
+            diagnostics,
         )
 
-    return pd.DataFrame(rows).sort_values(
+    result = pd.DataFrame(rows).sort_values(
         by=["score", "volume_ratio", "short_return_pct"], ascending=[False, False, False]
     ).head(top_n).reset_index(drop=True)
+    return _with_diagnostics(result, diagnostics)

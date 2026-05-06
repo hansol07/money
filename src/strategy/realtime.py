@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.data.fetch import get_intraday_stock_data
-from src.strategy.learning import apply_learning_adjustment, LearningAdjustment
+from src.data.fetch import get_intraday_stock_data, get_stock_event_summary, get_stock_news_summary, is_recent_price_data
+from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
 from src.strategy.universe import get_universe
 
@@ -13,7 +13,10 @@ def scan_intraday_market(
     universe: list[dict[str, str]] | None = None,
     interval: str = "5m",
     min_score: int = 55,
+    force_refresh: bool = False,
     learning_adjustments: dict[tuple[str, str, str], LearningAdjustment] | None = None,
+    event_adjustments: dict[str, ContextAdjustment] | None = None,
+    news_adjustments: dict[str, ContextAdjustment] | None = None,
 ) -> pd.DataFrame:
     candidates = universe if universe is not None else get_universe(market)
     rows: list[dict[str, object]] = []
@@ -21,12 +24,14 @@ def scan_intraday_market(
 
     for item in candidates:
         try:
-            data = get_intraday_stock_data(item["ticker"], period="5d", interval=interval)
-            if data.empty or len(data) < 25:
+            data = get_intraday_stock_data(item["ticker"], period="5d", interval=interval, force_refresh=force_refresh)
+            if data.empty or len(data) < 25 or not is_recent_price_data(data, max_age_days=1):
                 continue
 
             latest = data.iloc[-1]
             prev = data.iloc[-2]
+            event_summary = get_stock_event_summary(item["ticker"])
+            news_summary = get_stock_news_summary(item["ticker"])
             score = 40
             reasons: list[str] = []
 
@@ -56,6 +61,23 @@ def scan_intraday_market(
             if float(latest["Close"]) > float(prev["Close"]):
                 score += 6
 
+            event_risk = str(event_summary.get("event_risk", "") or "")
+            news_bias = str(news_summary.get("news_bias", "중립") or "중립")
+            news_score = int(news_summary.get("news_score", 0) or 0)
+
+            if event_risk == "높음":
+                score -= 5
+                reasons.append("가까운 일정이 있어 장중 흔들림이 커질 수 있습니다.")
+            elif event_risk == "중간":
+                score -= 2
+
+            if news_bias == "긍정":
+                score += min(5, max(1, news_score * 2))
+                reasons.append("최근 뉴스 흐름이 우호적입니다.")
+            elif news_bias == "부정":
+                score -= min(5, max(1, abs(news_score) * 2))
+                reasons.append("최근 뉴스 흐름이 부담입니다.")
+
             score = max(0, min(100, int(score + regime.adjustment)))
             if score < min_score:
                 continue
@@ -74,6 +96,13 @@ def scan_intraday_market(
                 setup=setup,
                 adjustments=learning_adjustments,
             )
+            score, context_delta, context_note = apply_context_adjustment(
+                base_score=score,
+                event_risk=event_risk,
+                news_bias=news_bias,
+                event_adjustments=event_adjustments,
+                news_adjustments=news_adjustments,
+            )
 
             if score < min_score:
                 continue
@@ -90,8 +119,21 @@ def scan_intraday_market(
                     "above_vwap": bool(float(latest["Close"]) > float(latest["vwap_proxy"])),
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
+                    "context_delta": context_delta,
+                    "event_risk": event_risk,
+                    "event_note": str(event_summary.get("event_note", "")),
+                    "earnings_date": str(event_summary.get("earnings_date", "")),
+                    "ex_dividend_date": str(event_summary.get("ex_dividend_date", "")),
+                    "news_bias": news_bias,
+                    "news_score": news_score,
+                    "news_count": int(news_summary.get("news_count", 0) or 0),
                     "learning_delta": learning_delta,
-                    "reason": " / ".join(([regime.note] if regime.note else []) + ([learning_note] if learning_note else []) + reasons[:4]),
+                    "reason": " / ".join(
+                        ([regime.note] if regime.note else [])
+                        + ([context_note] if context_note else [])
+                        + ([learning_note] if learning_note else [])
+                        + reasons[:4]
+                    ),
                 }
             )
         except Exception:
@@ -110,6 +152,14 @@ def scan_intraday_market(
                 "above_vwap",
                 "regime",
                 "regime_delta",
+                "context_delta",
+                "event_risk",
+                "event_note",
+                "earnings_date",
+                "ex_dividend_date",
+                "news_bias",
+                "news_score",
+                "news_count",
                 "learning_delta",
                 "reason",
             ]

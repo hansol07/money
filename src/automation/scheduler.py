@@ -117,7 +117,7 @@ class BackgroundAnalyzer:
             return 0, [f"{market}: {note}"]
 
         slot_key = self._half_hour_slot_key(market)
-        learning_adjustments, _ = build_learning_adjustments(limit=400, min_samples=3)
+        learning_adjustments, _, event_adjustments, news_adjustments, _ = build_learning_adjustments(limit=400, min_samples=3)
         saved_count = 0
         notes: list[str] = []
 
@@ -126,6 +126,8 @@ class BackgroundAnalyzer:
             interval="5m",
             min_score=60,
             learning_adjustments=learning_adjustments,
+            event_adjustments=event_adjustments,
+            news_adjustments=news_adjustments,
         )
         short_term_frame = build_short_term_trade_candidates(
             market,
@@ -133,6 +135,8 @@ class BackgroundAnalyzer:
             interval="5m",
             min_score=65,
             learning_adjustments=learning_adjustments,
+            event_adjustments=event_adjustments,
+            news_adjustments=news_adjustments,
         )
         high_risk_frame = build_high_risk_trade_candidates(
             market,
@@ -140,6 +144,8 @@ class BackgroundAnalyzer:
             interval="5m",
             min_score=60,
             learning_adjustments=learning_adjustments,
+            event_adjustments=event_adjustments,
+            news_adjustments=news_adjustments,
         )
 
         for scan_type, frame in [

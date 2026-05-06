@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data
+from src.data.fetch import get_stock_data, get_stock_event_summary, get_stock_news_summary, is_recent_price_data
 from src.portfolio.models import PositionInput
-from src.strategy.learning import apply_learning_adjustment, LearningAdjustment
+from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
 from src.strategy.recommendation import RecommendationResult, analyze_position
 from src.strategy.universe import get_universe
@@ -133,6 +133,8 @@ def scan_market(
     universe: list[dict[str, str]] | None = None,
     min_score: int = 60,
     learning_adjustments: dict[tuple[str, str, str], LearningAdjustment] | None = None,
+    event_adjustments: dict[str, ContextAdjustment] | None = None,
+    news_adjustments: dict[str, ContextAdjustment] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     regime = classify_market_regime(market)
@@ -141,7 +143,7 @@ def scan_market(
     for item in candidates:
         try:
             data = get_stock_data(item["ticker"])
-            if data.empty:
+            if data.empty or not is_recent_price_data(data, max_age_days=3):
                 continue
             analyzed = analyze_position(
                 data=data,
@@ -155,13 +157,39 @@ def scan_market(
             )
             profile = _build_candidate_profile(data)
             bonus = profile.trend_score + profile.momentum_score + profile.volume_score + profile.breakout_score
-            base_score = max(0, min(100, analyzed.score + bonus + regime.adjustment))
+            event_summary = get_stock_event_summary(item["ticker"])
+            news_summary = get_stock_news_summary(item["ticker"])
+            event_risk = str(event_summary.get("event_risk", "") or "")
+            news_bias = str(news_summary.get("news_bias", "중립") or "중립")
+            news_score = int(news_summary.get("news_score", 0) or 0)
+            event_delta = 0
+            event_reasons: list[str] = []
+            if event_risk == "높음":
+                event_delta -= 6
+                event_reasons.append("가까운 일정이 있어 변동성이 커질 수 있습니다.")
+            elif event_risk == "중간":
+                event_delta -= 2
+            if news_bias == "긍정":
+                event_delta += min(6, max(2, news_score * 2))
+                event_reasons.append("최근 뉴스 흐름이 우호적입니다.")
+            elif news_bias == "부정":
+                event_delta -= min(6, max(2, abs(news_score) * 2))
+                event_reasons.append("최근 뉴스 흐름이 다소 부담스럽습니다.")
+
+            base_score = max(0, min(100, analyzed.score + bonus + regime.adjustment + event_delta))
             adjusted_score, learning_delta, learning_note = apply_learning_adjustment(
                 base_score=base_score,
                 scan_type="today_scan",
                 market=market,
                 setup=profile.setup,
                 adjustments=learning_adjustments,
+            )
+            adjusted_score, context_delta, context_note = apply_context_adjustment(
+                base_score=adjusted_score,
+                event_risk=event_risk,
+                news_bias=news_bias,
+                event_adjustments=event_adjustments,
+                news_adjustments=news_adjustments,
             )
             analyzed.score = adjusted_score
 
@@ -199,9 +227,19 @@ def scan_market(
                     "target_1": target_1,
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
+                    "context_delta": context_delta,
+                    "event_risk": event_risk,
+                    "event_note": str(event_summary.get("event_note", "")),
+                    "earnings_date": str(event_summary.get("earnings_date", "")),
+                    "ex_dividend_date": str(event_summary.get("ex_dividend_date", "")),
+                    "news_bias": news_bias,
+                    "news_score": news_score,
+                    "news_count": int(news_summary.get("news_count", 0) or 0),
                     "learning_delta": learning_delta,
                     "reason": " / ".join(
                         ([regime.note] if regime.note else [])
+                        + event_reasons
+                        + ([context_note] if context_note else [])
                         + ([learning_note] if learning_note else [])
                         + (profile.reasons + analyzed.reasons)[:4]
                     ),
@@ -233,6 +271,14 @@ def scan_market(
                 "target_1",
                 "regime",
                 "regime_delta",
+                "context_delta",
+                "event_risk",
+                "event_note",
+                "earnings_date",
+                "ex_dividend_date",
+                "news_bias",
+                "news_score",
+                "news_count",
                 "learning_delta",
                 "reason",
             ]

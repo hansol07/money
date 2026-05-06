@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data, get_stock_dividend_details
+from src.data.fetch import get_stock_data, get_stock_dividend_details, is_recent_price_data
 from src.strategy.universe import get_dividend_universe
 
 
@@ -130,7 +130,7 @@ def build_dividend_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
     for item in get_dividend_universe(market):
         try:
             data = get_stock_data(item["ticker"])
-            if data.empty or len(data) < 180:
+            if data.empty or len(data) < 180 or not is_recent_price_data(data, max_age_days=3):
                 continue
 
             details = get_stock_dividend_details(item["ticker"])

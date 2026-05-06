@@ -1,0 +1,119 @@
+[
+  {
+    "market": "US",
+    "ticker": "AVGO",
+    "name": "브로드컴",
+    "quantity": 1.0,
+    "avg_price": 320.5,
+    "cash_budget": 1000,
+    "target_weight": 0.1
+  },
+  {
+    "market": "US",
+    "ticker": "GOOGL",
+    "name": "구글",
+    "quantity": 0.01,
+    "avg_price": 89.68,
+    "cash_budget": 1000,
+    "target_weight": 0.0
+  },
+  {
+    "market": "US",
+    "ticker": "IONQ",
+    "name": "아이온큐",
+    "quantity": 2.0,
+    "avg_price": 15.16,
+    "cash_budget": 1000,
+    "target_weight": 0.01
+  },
+  {
+    "market": "US",
+    "ticker": "JOBY",
+    "name": "조비 에비에이션",
+    "quantity": 25.0,
+    "avg_price": 15.24,
+    "cash_budget": 1000,
+    "target_weight": 0.05
+  },
+  {
+    "market": "US",
+    "ticker": "MO",
+    "name": "알트리아",
+    "quantity": 6.0,
+    "avg_price": 40.917,
+    "cash_budget": 1000,
+    "target_weight": 0.05
+  },
+  {
+    "market": "US",
+    "ticker": "MSFT",
+    "name": "마이크로소프트",
+    "quantity": 1.0,
+    "avg_price": 395.25,
+    "cash_budget": 1000,
+    "target_weight": 0.1
+  },
+  {
+    "market": "US",
+    "ticker": "NVDA",
+    "name": "엔비디아",
+    "quantity": 2.0,
+    "avg_price": 122.71,
+    "cash_budget": 1000,
+    "target_weight": 0.1
+  },
+  {
+    "market": "US",
+    "ticker": "O",
+    "name": "리얼티인컴",
+    "quantity": 2.0,
+    "avg_price": 62.425,
+    "cash_budget": 1000,
+    "target_weight": 0.1
+  },
+  {
+    "market": "US",
+    "ticker": "PLTR",
+    "name": "팔란티어",
+    "quantity": 101.0,
+    "avg_price": 28.0084,
+    "cash_budget": 1000,
+    "target_weight": 0.3
+  },
+  {
+    "market": "US",
+    "ticker": "RKLB",
+    "name": "로켓랩",
+    "quantity": 1.0,
+    "avg_price": 68.9,
+    "cash_budget": 1000,
+    "target_weight": 0.1
+  },
+  {
+    "market": "US",
+    "ticker": "SCHD",
+    "name": "배당ETF",
+    "quantity": 6.0,
+    "avg_price": 30.7483,
+    "cash_budget": 1000,
+    "target_weight": 0.2
+  },
+  {
+    "market": "US",
+    "ticker": "SOFI",
+    "name": "소파이",
+    "quantity": 1.0,
+    "avg_price": 17.7,
+    "cash_budget": 1000,
+    "target_weight": 0.05
+  },
+  {
+    "market": "US",
+    "ticker": "SYM",
+    "name": "심보틱",
+    "quantity": 1.0,
+    "avg_price": 49.5,
+    "cash_budget": 1000,
+    "target_weight": 0.05
+  }
+]

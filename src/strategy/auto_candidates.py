@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data
+from src.data.fetch import get_stock_data, is_recent_price_data
 from src.strategy.universe import get_universe
 
 
@@ -88,7 +88,7 @@ def build_auto_candidate_sets(market: str, top_n: int = 12) -> dict[str, pd.Data
 
     for item in universe:
         data = get_stock_data(item["ticker"])
-        if data.empty:
+        if data.empty or not is_recent_price_data(data, max_age_days=3):
             continue
 
         latest = data.iloc[-1]
@@ -128,7 +128,7 @@ def build_compounder_candidates(market: str, top_n: int = 12) -> pd.DataFrame:
 
     for item in universe:
         data = get_stock_data(item["ticker"])
-        if data.empty or len(data) < 252:
+        if data.empty or len(data) < 252 or not is_recent_price_data(data, max_age_days=3):
             continue
 
         latest = data.iloc[-1]

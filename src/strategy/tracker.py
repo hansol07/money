@@ -3,7 +3,8 @@ from __future__ import annotations
 import pandas as pd
 
 from src.data.fetch import get_stock_data
-from src.storage.local_store import load_scan_history
+from src.storage.local_store import load_recent_scan_history
+from src.strategy.universe import is_tradable_ticker
 
 
 def _get_future_rows(data: pd.DataFrame, captured_at: str) -> pd.DataFrame:
@@ -103,7 +104,7 @@ def _label_period(ret_value: float | None, target_hit: bool, stop_hit: bool, pat
 
 
 def _build_detail(limit: int = 200) -> pd.DataFrame:
-    history = load_scan_history()[-limit:]
+    history = load_recent_scan_history(limit=limit)
     rows: list[dict[str, object]] = []
 
     for entry in history:
@@ -114,7 +115,7 @@ def _build_detail(limit: int = 200) -> pd.DataFrame:
 
         for row in entry.get("rows", []):
             ticker = str(row.get("ticker", "")).strip().upper()
-            if not ticker:
+            if not ticker or not is_tradable_ticker(ticker):
                 continue
 
             data = get_stock_data(ticker)
@@ -163,6 +164,8 @@ def _build_detail(limit: int = 200) -> pd.DataFrame:
                     "name": row.get("name", ""),
                     "setup": row.get("setup", ""),
                     "action": row.get("action", ""),
+                    "event_risk": row.get("event_risk", ""),
+                    "news_bias": row.get("news_bias", ""),
                     "score": round(score, 2),
                     "current_price": round(base_price, 2),
                     "entry_price": round(float(row.get("entry_price", 0) or 0), 2) if row.get("entry_price", "") != "" else None,
