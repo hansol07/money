@@ -182,6 +182,79 @@ def _passes_high_risk_daily_prefilter(data: pd.DataFrame) -> bool:
     )
 
 
+def _intraday_chase_risk(intraday: pd.DataFrame) -> dict[str, object]:
+    def _num(value: object, default: float = 0.0) -> float:
+        numeric = pd.to_numeric(value, errors="coerce")
+        return default if pd.isna(numeric) else float(numeric)
+
+    if intraday.empty:
+        return {
+            "day_return_pct": 0.0,
+            "from_day_high_pct": 0.0,
+            "chase_penalty": 0,
+            "chase_label": "보통",
+            "wait_price": 0.0,
+            "note": "",
+        }
+
+    latest_close = _num(intraday["Close"].iloc[-1])
+    if latest_close <= 0:
+        return {
+            "day_return_pct": 0.0,
+            "from_day_high_pct": 0.0,
+            "chase_penalty": 0,
+            "chase_label": "보통",
+            "wait_price": 0.0,
+            "note": "",
+        }
+
+    if "Datetime" in intraday.columns:
+        timestamps = pd.to_datetime(intraday["Datetime"], errors="coerce")
+        latest_date = timestamps.iloc[-1].date() if not pd.isna(timestamps.iloc[-1]) else None
+        session = intraday[timestamps.dt.date == latest_date] if latest_date else intraday.tail(80)
+    else:
+        session = intraday.tail(80)
+    if session.empty:
+        session = intraday.tail(80)
+
+    day_open = _num(session["Open"].iloc[0], latest_close)
+    day_high = _num(pd.to_numeric(session["High"], errors="coerce").max(), latest_close)
+    vwap = _num(intraday.get("vwap_proxy", pd.Series([latest_close])).iloc[-1], latest_close)
+    day_return_pct = ((latest_close / day_open) - 1) * 100 if day_open > 0 else 0.0
+    from_day_high_pct = ((latest_close / day_high) - 1) * 100 if day_high > 0 else 0.0
+
+    penalty = 0
+    label = "보통"
+    note = ""
+    if day_return_pct >= 8 and from_day_high_pct >= -1.5:
+        penalty = 24
+        label = "추격금지"
+        note = "오늘 이미 크게 올라 고점 근처입니다. 눌림 확인 전 추격 금지."
+    elif day_return_pct >= 5 and from_day_high_pct >= -2.0:
+        penalty = 16
+        label = "눌림대기"
+        note = "당일 상승폭이 커서 바로 추격보다 눌림 진입이 낫습니다."
+    elif day_return_pct >= 3:
+        penalty = 8
+        label = "소액만"
+        note = "당일 상승폭이 있어 진입 금액을 줄이는 편이 낫습니다."
+
+    wait_price = min(latest_close, max(vwap, day_high * 0.985))
+    if label == "추격금지":
+        wait_price = min(vwap * 1.005, latest_close * 0.985)
+    elif label == "눌림대기":
+        wait_price = min(max(vwap, day_high * 0.975), latest_close * 0.995)
+
+    return {
+        "day_return_pct": round(day_return_pct, 2),
+        "from_day_high_pct": round(from_day_high_pct, 2),
+        "chase_penalty": penalty,
+        "chase_label": label,
+        "wait_price": round(max(0.01, wait_price), 2),
+        "note": note,
+    }
+
+
 def build_strategy_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFrame]:
     stable_rows: list[dict[str, object]] = []
     dividend_rows: list[dict[str, object]] = []
@@ -334,8 +407,15 @@ def build_short_term_trade_candidates(
             news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
             recent_low = float(intraday["session_low_20"].iloc[-2])
-            entry_price = max(float(intra_latest["Close"]), recent_high)
+            chase = _intraday_chase_risk(intraday)
+            current_price = float(intra_latest["Close"])
+            if str(chase["chase_label"]) in {"추격금지", "눌림대기"}:
+                entry_price = min(max(float(chase["wait_price"]), recent_high * 0.985), current_price)
+            else:
+                entry_price = max(current_price, recent_high)
             stop_loss = min(float(intra_latest["vwap_proxy"]), recent_low)
+            if stop_loss >= entry_price:
+                stop_loss = entry_price * 0.97
             atr = float(daily_latest.get("atr14", 0) or 0)
             risk_per_share = max(entry_price - stop_loss, atr, entry_price * 0.008)
             target_1 = entry_price + risk_per_share * 1.5
@@ -362,6 +442,10 @@ def build_short_term_trade_candidates(
                 reasons.append("평균가 위에서 잘 버티고 있습니다.")
             if 48 <= float(daily_latest["rsi"]) <= 72:
                 score += 8
+
+            if int(chase["chase_penalty"]) > 0:
+                score -= int(chase["chase_penalty"])
+                reasons.append(str(chase["note"]))
 
             event_risk = str(event_summary.get("event_risk", "") or "")
             news_bias = str(news_summary.get("news_bias", "중립") or "중립")
@@ -416,11 +500,18 @@ def build_short_term_trade_candidates(
                     "name": item["name"],
                     "setup": setup,
                     "score": score,
+                    "current_price": round(current_price, 2),
                     "entry_price": round(entry_price, 2),
                     "stop_loss": round(stop_loss, 2),
                     "target_1": round(target_1, 2),
                     "target_2": round(target_2, 2),
+                    "target_3": round(entry_price + risk_per_share * 3.5, 2),
+                    "entry_range": f"{round(entry_price * 0.992, 2)} ~ {round(entry_price * 1.003, 2)}",
                     "short_return_pct": round(float(intra_latest["short_return_pct"]), 2),
+                    "day_return_pct": chase["day_return_pct"],
+                    "from_day_high_pct": chase["from_day_high_pct"],
+                    "chase_risk": chase["chase_label"],
+                    "chase_penalty": -int(chase["chase_penalty"]),
                     "volume_ratio": round(float(intra_latest["volume_ratio"]), 2),
                     "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
                     "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
@@ -437,6 +528,11 @@ def build_short_term_trade_candidates(
                     "news_score": news_score,
                     "news_count": int(news_summary.get("news_count", 0) or 0),
                     "learning_delta": learning_delta,
+                    "price_basis": (
+                        f"현재가 {current_price:.2f}, 진입 {entry_price:.2f}, 손절 {stop_loss:.2f}. "
+                        f"당일 {float(chase['day_return_pct']):+.2f}%, 고점대비 {float(chase['from_day_high_pct']):+.2f}%, "
+                        f"추격위험 {chase['chase_label']}."
+                    ),
                     "reason": " / ".join(
                         ([regime.note] if regime.note else [])
                         + ([context_note] if context_note else [])
@@ -605,8 +701,13 @@ def build_high_risk_trade_candidates(
             news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
             recent_low = float(intraday["session_low_20"].iloc[-2])
+            chase = _intraday_chase_risk(intraday)
+            current_price = float(intra_latest["Close"])
 
-            entry_price = max(float(intra_latest["Close"]), recent_high)
+            if str(chase["chase_label"]) in {"추격금지", "눌림대기"}:
+                entry_price = min(max(float(chase["wait_price"]), recent_high * 0.98), current_price)
+            else:
+                entry_price = max(current_price, recent_high)
             stop_loss = min(float(intra_latest["vwap_proxy"]), recent_low)
             if stop_loss >= entry_price:
                 stop_loss = entry_price * 0.95
@@ -635,6 +736,10 @@ def build_high_risk_trade_candidates(
             if float(daily_latest["volume_ratio"]) >= 1.5:
                 score += 10
                 reasons.append("일봉 기준으로도 거래량이 살아 있습니다.")
+
+            if int(chase["chase_penalty"]) > 0:
+                score -= int(chase["chase_penalty"]) + 4
+                reasons.append(str(chase["note"]))
 
             setup = "고위험추격"
             if float(intra_latest["Close"]) >= recent_high and float(intra_latest["volume_ratio"]) >= 2.8:
@@ -684,11 +789,18 @@ def build_high_risk_trade_candidates(
                     "name": item["name"],
                     "setup": setup,
                     "score": score,
+                    "current_price": round(current_price, 2),
                     "entry_price": round(entry_price, 2),
                     "stop_loss": round(stop_loss, 2),
                     "target_1": round(target_1, 2),
                     "target_2": round(target_2, 2),
+                    "target_3": round(entry_price + risk_per_share * 5.0, 2),
+                    "entry_range": f"{round(entry_price * 0.985, 2)} ~ {round(entry_price * 1.002, 2)}",
                     "short_return_pct": round(float(intra_latest["short_return_pct"]), 2),
+                    "day_return_pct": chase["day_return_pct"],
+                    "from_day_high_pct": chase["from_day_high_pct"],
+                    "chase_risk": chase["chase_label"],
+                    "chase_penalty": -(int(chase["chase_penalty"]) + (4 if int(chase["chase_penalty"]) > 0 else 0)),
                     "volume_ratio": round(float(intra_latest["volume_ratio"]), 2),
                     "atr_pct": round(float(daily_latest.get("atr_pct", 0) or 0), 2),
                     "rs_score": round(float(daily_latest.get("rs_score", 0) or 0), 2),
@@ -706,6 +818,11 @@ def build_high_risk_trade_candidates(
                     "learning_delta": learning_delta,
                     "exit_rule": exit_rule,
                     "risk_level": "매우높음",
+                    "price_basis": (
+                        f"현재가 {current_price:.2f}, 진입 {entry_price:.2f}, 손절 {stop_loss:.2f}. "
+                        f"당일 {float(chase['day_return_pct']):+.2f}%, 고점대비 {float(chase['from_day_high_pct']):+.2f}%, "
+                        f"추격위험 {chase['chase_label']}."
+                    ),
                     "reason": " / ".join(
                         ([regime.note] if regime.note else [])
                         + ([context_note] if context_note else [])

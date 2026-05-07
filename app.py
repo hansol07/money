@@ -974,11 +974,16 @@ def _trade_column_config() -> dict[str, object]:
         "confidence_view": st.column_config.TextColumn("신뢰도", width="small"),
         "current_price": st.column_config.TextColumn("현재가", width="small"),
         "change_pct": st.column_config.NumberColumn("당일등락", format="%.2f", width="small"),
+        "entry_range": st.column_config.TextColumn("진입구간", width="medium"),
         "entry_price": st.column_config.TextColumn("진입가", width="small"),
         "stop_loss": st.column_config.TextColumn("손절가", width="small"),
         "target_1": st.column_config.TextColumn("1차목표", width="small"),
         "target_2": st.column_config.TextColumn("2차목표", width="small"),
         "target_3": st.column_config.TextColumn("3차목표", width="small"),
+        "chase_risk": st.column_config.TextColumn("추격위험", width="small"),
+        "day_return_pct": st.column_config.NumberColumn("당일상승", format="%.2f", width="small"),
+        "from_day_high_pct": st.column_config.NumberColumn("고점대비", format="%.2f", width="small"),
+        "chase_penalty": st.column_config.NumberColumn("추격보정", format="%d", width="small"),
         "price_basis": st.column_config.TextColumn("가격근거", width="large"),
         "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
         "regime": st.column_config.TextColumn("장세", width="small"),
@@ -1010,6 +1015,7 @@ def _timing_playbook(row: pd.Series) -> dict[str, str]:
     target_3 = pd.to_numeric(row.get("target_3", None), errors="coerce")
     confidence = _safe_int(row.get("confidence_score", 0))
     score = _safe_int(row.get("score", 0))
+    chase_risk = str(row.get("chase_risk", "") or "")
 
     if pd.isna(current):
         current = entry
@@ -1030,7 +1036,11 @@ def _timing_playbook(row: pd.Series) -> dict[str, str]:
     t3 = float(target_3) if not pd.isna(target_3) else entry_f + max(entry_f - stop_f, entry_f * 0.03) * 3.5
     risk = max(entry_f - stop_f, entry_f * 0.01)
 
-    if current_f <= stop_f:
+    if chase_risk == "추격금지":
+        action = "추격금지"
+    elif chase_risk == "눌림대기":
+        action = "눌림대기"
+    elif current_f <= stop_f:
         action = "손절/제외"
     elif current_f <= entry_f * 1.01 and score >= 65 and confidence >= 45:
         action = "진입검토"
@@ -1067,11 +1077,16 @@ def _prepare_trade_execution_view(frame: pd.DataFrame, *, include_risk_level: bo
         "confidence_detail",
         "price_basis",
         "current_price",
+        "entry_range",
         "entry_price",
         "stop_loss",
         "target_1",
         "target_2",
         "target_3",
+        "chase_risk",
+        "day_return_pct",
+        "from_day_high_pct",
+        "chase_penalty",
         "risk_reward_1",
         "timing_action",
         "exit_timing",
@@ -1113,11 +1128,16 @@ def _prepare_trade_execution_view(frame: pd.DataFrame, *, include_risk_level: bo
     ordered += [
         "timing_action",
         "current_price",
+        "entry_range",
         "entry_price",
         "stop_loss",
         "target_1",
         "target_2",
         "target_3",
+        "chase_risk",
+        "day_return_pct",
+        "from_day_high_pct",
+        "chase_penalty",
         "exit_timing",
         "add_timing",
         "scale_timing",
@@ -7223,17 +7243,24 @@ def render_short_term_trade_tab() -> None:
     interval = str(st.session_state.realtime_settings["interval"])
     min_score = max(60, int(st.session_state.realtime_settings["min_score"]))
     market_sweep_limit = int(st.session_state.scanner_settings["market_sweep_limit"])
+    deep_short_scan = st.toggle(
+        "정밀 탐색: 시장 탐색 수 전체 사용",
+        value=False,
+        key="short_trade_deep_scan",
+        help="꺼두면 버튼 반응 속도를 위해 시장별 최대 24개만 먼저 봅니다. 켜면 사이드바의 시장 탐색 수 전체를 사용합니다.",
+    )
+    effective_sweep_limit = market_sweep_limit if deep_short_scan else min(market_sweep_limit, 24)
 
     st.markdown("#### 단타 실행 모드 제안")
     _render_scan_advisor(purpose="short_term", key_prefix="short_term")
 
     run_col, hint_col = st.columns([1, 3])
     with run_col:
-        if st.button("단타 후보 계산", width="stretch"):
+        if st.button("단타 후보 계산", width="stretch", key="short_trade_run_button"):
             st.session_state["short_trade_ready"] = True
     with hint_col:
         st.caption(
-            f"현재 기준: `{interval}` / 최소점수 `{min_score}` / 시장 탐색 `{market_sweep_limit}`개. "
+            f"현재 기준: `{interval}` / 최소점수 `{min_score}` / 시장 탐색 `{effective_sweep_limit}`개. "
             "단타 후보는 분봉 조회가 많아 버튼을 눌렀을 때만 계산합니다."
         )
 
@@ -7241,13 +7268,15 @@ def render_short_term_trade_tab() -> None:
         st.info("단타 후보를 보려면 `단타 후보 계산`을 눌러 주세요.")
         return
 
+    st.info("단타는 당일 급등/고점 근접 종목에 추격매수 페널티를 적용합니다. 많이 오른 종목은 `추격금지` 또는 `눌림대기`로 내려갑니다.")
+
     learning_adjustments, _, event_adjustments, news_adjustments, _ = get_learning_state()
     _, _, _, _, pattern_stats = get_tracking_state()
     pattern_lookup = _build_pattern_lookup(pattern_stats)
     us_regime = classify_market_regime("US")
     kr_regime = classify_market_regime("KR")
-    us_universe = get_market_sweep_universe("US")[: max(1, market_sweep_limit)]
-    kr_universe = get_market_sweep_universe("KR")[: max(1, market_sweep_limit)]
+    us_universe = get_market_sweep_universe("US")[: max(1, effective_sweep_limit)]
+    kr_universe = get_market_sweep_universe("KR")[: max(1, effective_sweep_limit)]
     progress_cols = st.columns(4)
     us_trade_progress = progress_cols[0].progress(0.0, text="미국 일반 단타 대기")
     kr_trade_progress = progress_cols[1].progress(0.0, text="한국 일반 단타 대기")
