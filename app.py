@@ -607,6 +607,8 @@ def _attach_latest_quotes(
     current_prices: list[float | None] = []
     change_pcts: list[float | None] = []
     quote_as_ofs: list[str] = []
+    data_freshness_values: list[str] = []
+    price_sources: list[str] = []
 
     for _, row in enriched.iterrows():
         quote = get_latest_quote(str(row.get(ticker_column, "")), force_refresh=force_refresh)
@@ -618,7 +620,11 @@ def _attach_latest_quotes(
 
         current_prices.append(None if pd.isna(current_price) else float(current_price))
         change_pcts.append(None if pd.isna(change_pct) else float(change_pct))
-        quote_as_ofs.append(str(quote.get("as_of", "")))
+        quote_source = str(quote.get("source", "") or "")
+        quote_as_of = str(quote.get("as_of", "") or "")
+        quote_as_ofs.append(quote_as_of)
+        data_freshness_values.append(_quote_freshness_label(quote_as_of) if quote_as_of else str(row.get("data_freshness", "")))
+        price_sources.append("분봉" if quote_source == "5m" else "일봉" if quote_source == "1d" else str(row.get("price_source", "")))
 
         if "current_price" not in enriched.columns or pd.isna(pd.to_numeric(row.get("current_price", None), errors="coerce")):
             continue
@@ -632,6 +638,8 @@ def _attach_latest_quotes(
     enriched["current_price"] = current_prices
     enriched["change_pct"] = change_pcts
     enriched["quote_as_of"] = quote_as_ofs
+    enriched["data_freshness"] = data_freshness_values
+    enriched["price_source"] = price_sources
     return enriched
 
 
@@ -831,6 +839,8 @@ def _candidate_column_config() -> dict[str, object]:
         "confidence_detail": st.column_config.TextColumn("신뢰근거", width="medium"),
         "price_basis": st.column_config.TextColumn("가격근거", width="large"),
         "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
+        "data_freshness": st.column_config.TextColumn("데이터", width="small"),
+        "price_source": st.column_config.TextColumn("시세출처", width="small"),
         "regime": st.column_config.TextColumn("장세", width="small"),
         "regime_delta": st.column_config.NumberColumn("장세보정", format="%d", width="small"),
         "context_delta": st.column_config.NumberColumn("이벤트보정", format="%d", width="small"),
@@ -986,6 +996,8 @@ def _trade_column_config() -> dict[str, object]:
         "chase_penalty": st.column_config.NumberColumn("추격보정", format="%d", width="small"),
         "price_basis": st.column_config.TextColumn("가격근거", width="large"),
         "quote_as_of": st.column_config.TextColumn("시세기준", width="small"),
+        "data_freshness": st.column_config.TextColumn("데이터", width="small"),
+        "price_source": st.column_config.TextColumn("시세출처", width="small"),
         "regime": st.column_config.TextColumn("장세", width="small"),
         "regime_delta": st.column_config.NumberColumn("장세보정", format="%d", width="small"),
         "context_delta": st.column_config.NumberColumn("이벤트보정", format="%d", width="small"),
@@ -1003,6 +1015,28 @@ def _trade_column_config() -> dict[str, object]:
         "exit_rule": st.column_config.TextColumn("청산기준", width="medium"),
         "reason": st.column_config.TextColumn("핵심 사유", width="large"),
     }
+
+
+def _render_recommendation_definition(kind: str) -> None:
+    definitions = {
+        "today": (
+            "오늘추천의 의미",
+            "오늘 진입 후보입니다. 최근 차트/거래량/상대강도가 좋아 이번 주 또는 근시일 안에 위로 움직일 가능성을 보는 추천입니다.",
+            "필수 확인: 현재가, 진입가/진입구간, 손절가, 1~3차 매도가, 데이터 최신성, 신뢰도.",
+        ),
+        "trade": (
+            "단타의 의미",
+            "지금 들어가 짧은 구간의 탄력과 거래량을 먹고 나오는 실행 플랜입니다. 분봉/VWAP/거래량 기준이 중요하고 손절은 더 엄격하게 봅니다.",
+            "필수 확인: 현재가, 진입가, 손절가, 1~3차 매도가, 청산기준, 손익비, 분봉 최신성.",
+        ),
+        "long": (
+            "장기투자의 의미",
+            "차트 추세, 뉴스/이벤트, 장세와 상대강도를 종합해 계속 모아갈 후보를 고르는 추천입니다. 단기 급등보다 누적 매수 가능성과 장기 우상향을 봅니다.",
+            "필수 확인: 현재가, 분할 진입가, 이탈 기준, 1~3차 목표, 장세/뉴스/데이터 최신성.",
+        ),
+    }
+    title, meaning, checklist = definitions[kind]
+    st.info(f"**{title}**\n\n{meaning}\n\n{checklist}")
 
 
 def _timing_playbook(row: pd.Series) -> dict[str, str]:
@@ -1076,6 +1110,8 @@ def _prepare_trade_execution_view(frame: pd.DataFrame, *, include_risk_level: bo
         "confidence_score",
         "confidence_detail",
         "price_basis",
+        "data_freshness",
+        "price_source",
         "current_price",
         "entry_range",
         "entry_price",
@@ -1156,6 +1192,8 @@ def _prepare_trade_execution_view(frame: pd.DataFrame, *, include_risk_level: bo
         "score",
         "change_pct",
         "quote_as_of",
+        "data_freshness",
+        "price_source",
         "event_risk",
         "earnings_date",
         "ex_dividend_date",
@@ -1213,6 +1251,8 @@ def _prepare_recommendation_execution_view(
         "price_basis",
         "change_pct",
         "quote_as_of",
+        "data_freshness",
+        "price_source",
         "event_risk",
         "earnings_date",
         "ex_dividend_date",
@@ -1271,6 +1311,10 @@ def _prepare_recommendation_execution_view(
         view["confidence_score"] = pd.to_numeric(view["confidence_score"], errors="coerce").fillna(
             pd.to_numeric(view.get("score", 0), errors="coerce").fillna(0) * 0.65
         ).clip(lower=0, upper=100).astype(int)
+        freshness_penalty = view["data_freshness"].astype(str).map(
+            {"약간 지연": 5, "오래됨": 14, "기준없음": 20}
+        ).fillna(0)
+        view["confidence_score"] = (view["confidence_score"] - freshness_penalty).clip(lower=0, upper=100).astype(int)
 
     missing_confidence = view["confidence_detail"].astype(str).str.strip().isin(["", "None", "nan"])
     if missing_confidence.any():
@@ -1308,6 +1352,8 @@ def _prepare_recommendation_execution_view(
         "action",
         "change_pct",
         "quote_as_of",
+        "data_freshness",
+        "price_source",
         "event_risk",
         "earnings_date",
         "ex_dividend_date",
@@ -2098,6 +2144,8 @@ def _enrich_recommendation_frame(
         "current_price": None,
         "change_pct": None,
         "quote_as_of": "",
+        "data_freshness": "",
+        "price_source": "",
         "entry_price": None,
         "stop_loss": None,
         "target_1": None,
@@ -2180,6 +2228,13 @@ def _enrich_recommendation_frame(
         learning_delta = _safe_int(row.get("learning_delta", 0))
         context_delta = _safe_int(row.get("context_delta", 0))
         base_confidence = 42 + min(24, samples * 2) + max(-12, min(12, learning_delta + context_delta))
+        data_freshness = str(row.get("data_freshness", "") or "")
+        if data_freshness == "약간 지연":
+            base_confidence -= 5
+        elif data_freshness == "오래됨":
+            base_confidence -= 14
+        elif data_freshness == "기준없음":
+            base_confidence -= 20
         if hit_rate > 0:
             base_confidence += int((hit_rate - 50) * 0.35)
         if target_rate > 0:
@@ -5083,6 +5138,8 @@ def render_portfolio_outlook() -> None:
                     "momentum_state": row.get("momentum_state", ""),
                     "risk_level": row.get("risk_level", ""),
                     "weight_status": row.get("weight_status", ""),
+                    "data_freshness": row.get("data_freshness", ""),
+                    "price_source": row.get("price_source", ""),
                     "event_risk": event_risk,
                     "news_bias": news_bias,
                     "alert_message": alert_message,
@@ -5136,6 +5193,8 @@ def render_portfolio_outlook() -> None:
                         "momentum_state",
                         "risk_level",
                         "weight_status",
+                        "data_freshness",
+                        "price_source",
                         "event_risk",
                         "news_bias",
                         "alert_message",
@@ -5157,6 +5216,8 @@ def render_portfolio_outlook() -> None:
                     "momentum_state": st.column_config.TextColumn("차트상태", width="small"),
                     "risk_level": st.column_config.TextColumn("위험도", width="small"),
                     "weight_status": st.column_config.TextColumn("비중상태", width="small"),
+                    "data_freshness": st.column_config.TextColumn("데이터", width="small"),
+                    "price_source": st.column_config.TextColumn("시세출처", width="small"),
                     "event_risk": st.column_config.TextColumn("이벤트", width="small"),
                     "news_bias": st.column_config.TextColumn("뉴스", width="small"),
                     "alert_message": st.column_config.TextColumn("요약", width="large"),
@@ -6173,7 +6234,7 @@ def render_news_event_tab() -> None:
 
 def render_market_scanner() -> None:
     st.subheader("오늘 매수 후보 스캐너")
-    st.caption("오늘 강한 종목을 점수화합니다.")
+    st.caption("오늘 진입했을 때 이번 주 또는 근시일 안의 상승 가능성이 높은 최근 차트 후보를 점수화합니다.")
     min_score = int(st.session_state.scanner_settings["min_score"])
     scan_limit = min(30, int(st.session_state.scanner_settings["scan_limit"]))
     st.caption(f"상세 스캐너는 화면 멈춤을 막기 위해 이번 실행에서 시장별 최대 {scan_limit}개만 확인합니다.")
@@ -6199,7 +6260,7 @@ def render_market_scanner() -> None:
         if us_scan.empty:
             st.info("조건을 만족한 미국 후보가 없습니다.")
         else:
-            us_view = _prepare_recommendation_execution_view(us_scan, include_market=False, default_market="US")
+            us_view = _prepare_recommendation_execution_view(us_scan, include_market=True, default_market="US")
             _show_table(
                 us_view,
                 datetime_columns=["quote_as_of"],
@@ -6214,7 +6275,7 @@ def render_market_scanner() -> None:
         if kr_scan.empty:
             st.info("조건을 만족한 한국 후보가 없습니다.")
         else:
-            kr_view = _prepare_recommendation_execution_view(kr_scan, include_market=False, default_market="KR")
+            kr_view = _prepare_recommendation_execution_view(kr_scan, include_market=True, default_market="KR")
             _show_table(
                 kr_view,
                 datetime_columns=["quote_as_of"],
@@ -6249,7 +6310,7 @@ def render_market_scanner() -> None:
 
 def render_buy_now_panel() -> None:
     st.subheader("오늘 바로 볼 종목")
-    st.caption("강한 후보와 대안을 봅니다.")
+    st.caption("오늘 진입 검토가 가능한 후보와 대안을 봅니다.")
     min_score = int(st.session_state.scanner_settings["min_score"])
     top_n = int(st.session_state.scanner_settings["top_n"])
     scan_limit = min(12, int(st.session_state.scanner_settings["scan_limit"]))
@@ -6276,7 +6337,9 @@ def render_buy_now_panel() -> None:
     top = combined.sort_values(by=["score", "ticker"], ascending=[False, True]).head(top_n).reset_index(drop=True)
     best_row = top.iloc[0]
     col1, col2, col3 = st.columns(3)
-    col1.metric("최상위 후보", str(best_row["ticker"]))
+    best_market = str(best_row.get("market", "") or "")
+    best_label = f"{best_market} {best_row['ticker']}".strip()
+    col1.metric("최상위 후보", best_label)
     col2.metric("최고 판단", str(best_row["score_view"]))
     col3.metric("후보 수", len(combined))
     _render_action_deck(top.assign(bucket="오늘추천"), title="오늘 결정 카드", limit=4)
@@ -6339,6 +6402,7 @@ def render_buy_now_panel() -> None:
 
 def render_today_recommendation_page() -> None:
     st.subheader("오늘 추천")
+    _render_recommendation_definition("today")
     st.caption("버튼을 눌러 오늘 후보를 계산합니다.")
 
     if not _render_data_freshness_gate(purpose="오늘 추천", require_intraday=False):
@@ -6387,14 +6451,12 @@ def render_new_recommendation_hub() -> None:
     )
 
     if direction == "오늘 당장":
-        st.info("실시간/오늘 추천 성격입니다. 진입 전 현재가와 손절가를 우선 확인하세요.")
         _safe_render("오늘 추천", render_today_recommendation_page)
         with st.expander("실시간 급등주 스캐너 열기", expanded=False):
             _safe_render("실시간", render_realtime_tab)
     elif direction == "단타":
         _safe_render("단타", render_short_term_trade_tab)
     elif direction == "장기 보유":
-        st.info("장기 보유 후보는 단기 급등보다 추세, 재무/배당, 누적 학습 신뢰도를 더 봅니다.")
         if _render_data_freshness_gate(purpose="장기 보유 추천", require_intraday=False):
             _safe_render("장기/전략 추천", render_strategy_profiles_tab)
     elif direction == "배당주":
@@ -6708,28 +6770,11 @@ def render_realtime_tab() -> None:
 
     st.markdown("#### 실시간 탑픽")
     top = combined.head(int(st.session_state.scanner_settings["top_n"]))
+    top_view = _prepare_recommendation_execution_view(top, include_market=True, include_source=False)
     _show_table(
-        top[
-            [
-                "market",
-                "ticker",
-                "name",
-                "setup",
-                "score",
-                "regime",
-                "regime_delta",
-                "learning_delta",
-                "current_price",
-                "change_pct",
-                "quote_as_of",
-                "volume_ratio",
-                "short_return_pct",
-                "above_vwap",
-                "reason",
-            ]
-        ],
+        top_view,
         datetime_columns=["quote_as_of"],
-        currency_columns=["current_price"],
+        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
         column_config=_candidate_column_config(),
     )
 
@@ -6795,13 +6840,27 @@ def render_auto_candidates_tab() -> None:
             if us_sets[key].empty:
                 st.info("미국 후보가 없습니다.")
             else:
-                _show_table(us_sets[key], currency_columns=["current_price"], default_market="US", column_config=_candidate_column_config())
+                us_view = _prepare_recommendation_execution_view(us_sets[key], include_market=True, default_market="US")
+                _show_table(
+                    us_view,
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                    default_market="US",
+                    column_config=_candidate_column_config(),
+                )
         with right:
             st.caption("한국")
             if kr_sets[key].empty:
                 st.info("한국 후보가 없습니다.")
             else:
-                _show_table(kr_sets[key], currency_columns=["current_price"], default_market="KR", column_config=_candidate_column_config())
+                kr_view = _prepare_recommendation_execution_view(kr_sets[key], include_market=True, default_market="KR")
+                _show_table(
+                    kr_view,
+                    datetime_columns=["quote_as_of"],
+                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                    default_market="KR",
+                    column_config=_candidate_column_config(),
+                )
 
     history = load_recent_scan_history(limit=20)
     st.markdown("#### 누적 스냅샷 이력")
@@ -6940,7 +6999,8 @@ def render_tracking_tab() -> None:
 
     st.divider()
     st.subheader("장기 복리 후보")
-    st.caption("장기 추세형 후보.")
+    _render_recommendation_definition("long")
+    st.caption("계속 모아갈 만한 장기 추세형 후보입니다.")
 
     top_n = int(st.session_state.scanner_settings["top_n"])
     us_compounders = build_compounder_candidates("US", top_n=top_n)
@@ -6951,12 +7011,26 @@ def render_tracking_tab() -> None:
         if us_compounders.empty:
             st.info("미국 장기 후보가 없습니다.")
         else:
-            _show_table(us_compounders, currency_columns=["current_price"], default_market="US", column_config=_candidate_column_config())
+            us_view = _prepare_recommendation_execution_view(us_compounders, include_market=True, default_market="US")
+            _show_table(
+                us_view,
+                datetime_columns=["quote_as_of"],
+                currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                default_market="US",
+                column_config=_candidate_column_config(),
+            )
     with kr_tab:
         if kr_compounders.empty:
             st.info("한국 장기 후보가 없습니다.")
         else:
-            _show_table(kr_compounders, currency_columns=["current_price"], default_market="KR", column_config=_candidate_column_config())
+            kr_view = _prepare_recommendation_execution_view(kr_compounders, include_market=True, default_market="KR")
+            _show_table(
+                kr_view,
+                datetime_columns=["quote_as_of"],
+                currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                default_market="KR",
+                column_config=_candidate_column_config(),
+            )
 
 
 def render_manual_tracking_tab() -> None:
@@ -7112,7 +7186,8 @@ def render_manual_tracking_tab() -> None:
 
 def render_strategy_profiles_tab() -> None:
     st.subheader("전략별 추천")
-    st.caption("안정/배당/성장 후보.")
+    _render_recommendation_definition("long")
+    st.caption("안정/배당/성장 후보를 장기 보유 관점으로 봅니다.")
 
     top_n = int(st.session_state.scanner_settings["top_n"])
     us_profiles = get_strategy_profiles_state("US", top_n)
@@ -7132,7 +7207,7 @@ def render_strategy_profiles_tab() -> None:
             if us_profiles[key].empty:
                 st.info("미국 후보가 없습니다.")
             else:
-                us_view = _prepare_recommendation_execution_view(us_profiles[key], include_market=False, default_market="US")
+                us_view = _prepare_recommendation_execution_view(us_profiles[key], include_market=True, default_market="US")
                 _show_table(
                     us_view,
                     currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
@@ -7144,7 +7219,7 @@ def render_strategy_profiles_tab() -> None:
             if kr_profiles[key].empty:
                 st.info("한국 후보가 없습니다.")
             else:
-                kr_view = _prepare_recommendation_execution_view(kr_profiles[key], include_market=False, default_market="KR")
+                kr_view = _prepare_recommendation_execution_view(kr_profiles[key], include_market=True, default_market="KR")
                 _show_table(
                     kr_view,
                     currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
@@ -7180,7 +7255,7 @@ def render_dividend_tab() -> None:
                 else:
                     stable_view = _prepare_recommendation_execution_view(
                         profiles["stable"],
-                        include_market=False,
+                        include_market=True,
                         default_market=market_code,
                         include_targets=False,
                         extra_columns=[
@@ -7205,7 +7280,7 @@ def render_dividend_tab() -> None:
                 else:
                     growth_view = _prepare_recommendation_execution_view(
                         profiles["growth"],
-                        include_market=False,
+                        include_market=True,
                         default_market=market_code,
                         include_targets=False,
                         extra_columns=[
@@ -7233,7 +7308,8 @@ def render_dividend_tab() -> None:
 
 def render_short_term_trade_tab() -> None:
     st.subheader("단타 트레이드 플랜")
-    st.caption("단타/고위험 단타의 진입, 손절, 목표.")
+    _render_recommendation_definition("trade")
+    st.caption("단타/고위험 단타의 즉시 진입, 손절, 목표.")
 
     if not _render_data_freshness_gate(purpose="단타 추천", require_intraday=True):
         st.info("최신 분봉 기준이 확인될 때까지 단타 추천을 표시하지 않습니다.")
@@ -7621,7 +7697,7 @@ def _quote_freshness_label(value: object) -> str:
 def _build_dashboard_checklist(outlook: pd.DataFrame, analysis: pd.DataFrame, recent_candidates: pd.DataFrame) -> list[str]:
     checklist: list[str] = []
     if not outlook.empty:
-        if "quote_as_of" in outlook.columns:
+        if "data_freshness" not in outlook.columns and "quote_as_of" in outlook.columns:
             outlook["data_freshness"] = outlook["quote_as_of"].apply(_quote_freshness_label)
         caution = outlook[outlook["outlook"].isin(["하방 주의"])]
         event_high = outlook[outlook["event_risk"] == "높음"]

@@ -4,7 +4,15 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data, get_stock_event_summary, get_stock_news_summary, is_recent_price_data
+from src.data.fetch import (
+    get_stock_data,
+    get_stock_event_summary,
+    get_stock_news_summary,
+    is_recent_price_data,
+    latest_price_timestamp,
+    price_data_freshness_label,
+    price_source_label,
+)
 from src.portfolio.models import PositionInput
 from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
@@ -204,6 +212,7 @@ def scan_market(
                 analyzed.action = "보류"
 
             latest = data.iloc[-1]
+            latest_ts = latest_price_timestamp(data)
             entry_price, stop_loss, target_1 = _build_trade_plan(data)
             rows.append(
                 {
@@ -225,6 +234,9 @@ def scan_market(
                     "entry_price": entry_price,
                     "stop_loss": stop_loss,
                     "target_1": target_1,
+                    "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+                    "data_freshness": price_data_freshness_label(data, intraday=False),
+                    "price_source": price_source_label(data, intraday=False),
                     "regime": regime.regime,
                     "regime_delta": regime.adjustment,
                     "context_delta": context_delta,
@@ -269,6 +281,9 @@ def scan_market(
                 "entry_price",
                 "stop_loss",
                 "target_1",
+                "quote_as_of",
+                "data_freshness",
+                "price_source",
                 "regime",
                 "regime_delta",
                 "context_delta",

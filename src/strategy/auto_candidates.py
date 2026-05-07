@@ -4,7 +4,13 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data, is_recent_price_data
+from src.data.fetch import (
+    get_stock_data,
+    is_recent_price_data,
+    latest_price_timestamp,
+    price_data_freshness_label,
+    price_source_label,
+)
 from src.strategy.universe import get_universe
 
 
@@ -96,12 +102,29 @@ def build_auto_candidate_sets(market: str, top_n: int = 12) -> dict[str, pd.Data
         weekly_score, weekly_reasons = _score_weekly(data)
         daily_score, daily_reasons = _score_daily(data)
         next_day_score, next_day_reasons = _score_next_day(data)
+        close_price = float(latest["Close"])
+        atr = float(latest.get("atr14", 0) or 0)
+        recent_low = float(data["Low"].tail(20).min()) if "Low" in data.columns else close_price * 0.92
+        stop_loss = min(close_price * 0.92, recent_low * 0.99)
+        if stop_loss <= 0 or stop_loss >= close_price:
+            stop_loss = close_price * 0.92
+        risk = max(close_price - stop_loss, atr, close_price * 0.03)
+        latest_ts = latest_price_timestamp(data)
 
         base = {
             "market": market,
             "ticker": item["ticker"],
             "name": item["name"],
-            "current_price": round(float(latest["Close"]), 2),
+            "current_price": round(close_price, 2),
+            "entry_price": round(close_price, 2),
+            "stop_loss": round(stop_loss, 2),
+            "target_1": round(close_price + risk * 1.5, 2),
+            "target_2": round(close_price + risk * 2.5, 2),
+            "target_3": round(close_price + risk * 3.5, 2),
+            "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+            "data_freshness": price_data_freshness_label(data, intraday=False),
+            "price_source": price_source_label(data, intraday=False),
+            "price_basis": "현재가 기준 진입, 최근 20일 저점/ATR 기준 손절, 1~3차 목표 자동 산정",
             "volume_ratio": round(float(latest["volume_ratio"]), 2),
             "return_20d": round(float(latest["return_20d"]), 2),
             "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -152,6 +175,15 @@ def build_compounder_candidates(market: str, top_n: int = 12) -> pd.DataFrame:
         if latest["macd_diff"] > 0:
             score += 10
 
+        close_price = float(latest["Close"])
+        ma120 = float(latest.get("ma120", close_price) or close_price)
+        atr = float(latest.get("atr14", 0) or 0)
+        risk_buffer = max(atr * 2.2, close_price * 0.12)
+        stop_loss = max(ma120 * 0.96, close_price - risk_buffer)
+        if stop_loss >= close_price:
+            stop_loss = close_price * 0.88
+        latest_ts = latest_price_timestamp(data)
+
         rows.append(
             {
                 "market": market,
@@ -160,12 +192,41 @@ def build_compounder_candidates(market: str, top_n: int = 12) -> pd.DataFrame:
                 "score": score,
                 "return_1y_pct": round(annual_return, 2),
                 "return_6m_pct": round(float(latest["return_60d"]), 2),
-                "current_price": round(float(latest["Close"]), 2),
+                "current_price": round(close_price, 2),
+                "entry_price": round(close_price, 2),
+                "stop_loss": round(max(0.01, stop_loss), 2),
+                "target_1": round(close_price * 1.15, 2),
+                "target_2": round(close_price * 1.28, 2),
+                "target_3": round(close_price * 1.45, 2),
+                "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+                "data_freshness": price_data_freshness_label(data, intraday=False),
+                "price_source": price_source_label(data, intraday=False),
+                "price_basis": "장기 후보는 현재가 기준 분할 진입, 120일선/ATR 기준 이탈가, 15/28/45% 목표를 기본값으로 산정",
                 "reason": " / ".join(reasons[:3]),
             }
         )
 
     if not rows:
-        return pd.DataFrame(columns=["market", "ticker", "name", "score", "return_1y_pct", "return_6m_pct", "current_price", "reason"])
+        return pd.DataFrame(
+            columns=[
+                "market",
+                "ticker",
+                "name",
+                "score",
+                "return_1y_pct",
+                "return_6m_pct",
+                "current_price",
+                "entry_price",
+                "stop_loss",
+                "target_1",
+                "target_2",
+                "target_3",
+                "quote_as_of",
+                "data_freshness",
+                "price_source",
+                "price_basis",
+                "reason",
+            ]
+        )
 
     return pd.DataFrame(rows).sort_values(by=["score", "return_1y_pct"], ascending=[False, False]).head(top_n).reset_index(drop=True)

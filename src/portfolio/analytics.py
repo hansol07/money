@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.data.fetch import (
+    is_recent_price_data,
+    latest_price_timestamp,
     get_latest_quote,
     get_stock_dividend_yield,
     get_stock_event_summary,
@@ -76,6 +78,32 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     if pd.isna(numeric):
         return default
     return float(numeric)
+
+
+def _quote_freshness_label(value: object) -> str:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return "기준없음"
+    if getattr(ts, "tzinfo", None) is not None:
+        ts = ts.tz_convert(None)
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    age_days = (now - pd.Timestamp(ts)).days
+    if age_days <= 1:
+        return "최신"
+    if age_days <= 3:
+        return "약간 지연"
+    return "오래됨"
+
+
+def _price_source_label(quote: dict[str, object], *, daily_data: pd.DataFrame) -> str:
+    source = str(quote.get("source", "") or "").strip().lower()
+    if source == "5m":
+        return "분봉"
+    if source == "1d":
+        return "일봉"
+    if not daily_data.empty and is_recent_price_data(daily_data, max_age_days=3):
+        return "일봉대체"
+    return "기준없음"
 
 
 def _build_outlook_action(
@@ -412,7 +440,6 @@ def build_rebalance_suggestions(
 
 def build_portfolio_outlook(portfolio: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    current_values: list[float] = []
     prepared_rows: list[dict[str, object]] = []
 
     for row in portfolio.to_dict("records"):
@@ -424,37 +451,50 @@ def build_portfolio_outlook(portfolio: pd.DataFrame) -> pd.DataFrame:
             continue
         latest = data.iloc[-1]
         quote = get_latest_quote(ticker)
+        event_summary = get_stock_event_summary(ticker)
+        news_summary = get_stock_news_summary(ticker)
+        dividend_yield_pct = float(get_stock_dividend_yield(ticker))
         current_price = pd.to_numeric(quote.get("current_price", latest.get("Close")), errors="coerce")
         if pd.isna(current_price):
             current_price = pd.to_numeric(latest.get("Close", None), errors="coerce")
         quantity = _safe_float(row.get("quantity", 0))
-        current_values.append(float(current_price) * quantity if not pd.isna(current_price) else 0.0)
-        prepared_rows.append(row)
+        current_value = float(current_price) * quantity if not pd.isna(current_price) else 0.0
+        prepared_rows.append(
+            {
+                "row": row,
+                "ticker": ticker,
+                "market": str(row.get("market", "")).strip().upper(),
+                "name": str(row.get("name", "") or ""),
+                "data": data,
+                "latest": latest,
+                "quote": quote,
+                "event_summary": event_summary,
+                "news_summary": news_summary,
+                "dividend_yield_pct": dividend_yield_pct,
+                "current_price": current_price,
+                "current_value": current_value,
+            }
+        )
 
-    total_current_value = float(sum(current_values)) if current_values else 0.0
+    total_current_value = float(sum(item["current_value"] for item in prepared_rows)) if prepared_rows else 0.0
 
-    for row in prepared_rows:
-        ticker = str(row.get("ticker", "")).strip().upper()
-        market = str(row.get("market", "")).strip().upper()
-        name = str(row.get("name", "") or "")
-        if not ticker:
-            continue
+    for item in prepared_rows:
+        row = item["row"]
+        ticker = str(item["ticker"])
+        market = str(item["market"])
+        name = str(item["name"])
+        data = item["data"]
+        latest = item["latest"]
+        quote = item["quote"]
+        event_summary = item["event_summary"]
+        news_summary = item["news_summary"]
 
-        data = get_stock_data(ticker)
-        if data.empty:
-            continue
-
-        latest = data.iloc[-1]
-        quote = get_latest_quote(ticker)
-        event_summary = get_stock_event_summary(ticker)
-        news_summary = get_stock_news_summary(ticker)
-
-        current_price = pd.to_numeric(quote.get("current_price", latest.get("Close")), errors="coerce")
+        current_price = pd.to_numeric(item["current_price"], errors="coerce")
         change_pct = pd.to_numeric(quote.get("change_pct", None), errors="coerce")
         quantity = _safe_float(row.get("quantity", 0))
         avg_price = _safe_float(row.get("avg_price", 0))
         target_weight_pct = _safe_float(row.get("target_weight", 0)) * 100
-        current_value = (float(current_price) if not pd.isna(current_price) else float(latest["Close"])) * quantity
+        current_value = float(item["current_value"])
         current_weight_pct = current_value / total_current_value * 100 if total_current_value > 0 else 0.0
         return_pct = ((float(current_price) - avg_price) / avg_price * 100) if avg_price > 0 and not pd.isna(current_price) else 0.0
         returns = data["Close"].pct_change().dropna()
@@ -463,10 +503,15 @@ def build_portfolio_outlook(portfolio: pd.DataFrame) -> pd.DataFrame:
         drawdown_pct = float((trailing / trailing.cummax() - 1).min() * 100) if not trailing.empty else 0.0
         return_6m_pct = float(data["Close"].pct_change(126).iloc[-1] * 100) if len(data) > 126 else 0.0
         return_1y_pct = float(data["Close"].pct_change(252).iloc[-1] * 100) if len(data) > 252 else 0.0
-        dividend_yield_pct = float(get_stock_dividend_yield(ticker))
+        dividend_yield_pct = float(item["dividend_yield_pct"])
         risk_level = _classify_risk(volatility_pct, drawdown_pct)
         style = _classify_style(return_6m_pct, dividend_yield_pct, volatility_pct)
         momentum_state = _classify_momentum_state(latest)
+        quote_as_of = str(quote.get("as_of", "") or "")
+        latest_bar_ts = latest_price_timestamp(data)
+        daily_as_of = latest_bar_ts.strftime("%Y-%m-%d") if latest_bar_ts is not None else ""
+        data_freshness = _quote_freshness_label(quote_as_of or daily_as_of)
+        price_source = _price_source_label(quote, daily_data=data)
         score = 50
         reasons: list[str] = []
 
@@ -601,7 +646,9 @@ def build_portfolio_outlook(portfolio: pd.DataFrame) -> pd.DataFrame:
                 "accumulate_price": round(accumulate_price, 2) if accumulate_price > 0 else None,
                 "caution_price": round(caution_price, 2) if caution_price > 0 else None,
                 "target_price": round(target_price, 2) if target_price > 0 else None,
-                "quote_as_of": str(quote.get("as_of", "")),
+                "quote_as_of": quote_as_of,
+                "data_freshness": data_freshness,
+                "price_source": price_source,
                 "event_risk": event_risk,
                 "earnings_date": str(event_summary.get("earnings_date", "")),
                 "ex_dividend_date": str(event_summary.get("ex_dividend_date", "")),
@@ -648,6 +695,8 @@ def build_portfolio_outlook(portfolio: pd.DataFrame) -> pd.DataFrame:
                 "caution_price",
                 "target_price",
                 "quote_as_of",
+                "data_freshness",
+                "price_source",
                 "event_risk",
                 "earnings_date",
                 "ex_dividend_date",
