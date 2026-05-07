@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.data.fetch import get_intraday_stock_data, get_stock_event_summary, get_stock_news_summary, is_recent_price_data
+from src.data.fetch import (
+    get_intraday_stock_data,
+    get_stock_event_summary,
+    get_stock_news_summary,
+    is_recent_price_data,
+    latest_price_timestamp,
+    price_data_freshness_label,
+    price_source_label,
+)
 from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
 from src.strategy.universe import get_universe
@@ -107,6 +115,7 @@ def scan_intraday_market(
             if score < min_score:
                 continue
 
+            latest_ts = latest_price_timestamp(data)
             rows.append(
                 {
                     "ticker": item["ticker"],
@@ -114,6 +123,9 @@ def scan_intraday_market(
                     "setup": setup,
                     "score": score,
                     "current_price": round(float(latest["Close"]), 2),
+                    "quote_as_of": latest_ts.strftime("%Y-%m-%d %H:%M") if latest_ts is not None else "",
+                    "data_freshness": price_data_freshness_label(data, intraday=True),
+                    "price_source": price_source_label(data, intraday=True),
                     "volume_ratio": round(float(latest["volume_ratio"]), 2),
                     "short_return_pct": round(float(latest["short_return_pct"]), 2),
                     "above_vwap": bool(float(latest["Close"]) > float(latest["vwap_proxy"])),
@@ -147,6 +159,9 @@ def scan_intraday_market(
                 "setup",
                 "score",
                 "current_price",
+                "quote_as_of",
+                "data_freshness",
+                "price_source",
                 "volume_ratio",
                 "short_return_pct",
                 "above_vwap",

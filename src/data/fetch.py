@@ -58,6 +58,33 @@ def latest_price_timestamp(data: pd.DataFrame) -> pd.Timestamp | None:
     return pd.Timestamp(latest)
 
 
+def price_data_freshness_label(data: pd.DataFrame, *, intraday: bool = False) -> str:
+    latest = latest_price_timestamp(data)
+    if latest is None:
+        return "기준없음"
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    age_days = (now - latest).days
+    if intraday:
+        if age_days <= 0:
+            return "최신"
+        if age_days <= 1:
+            return "약간 지연"
+        return "오래됨"
+    if age_days <= 1:
+        return "최신"
+    if age_days <= 3:
+        return "약간 지연"
+    return "오래됨"
+
+
+def price_source_label(data: pd.DataFrame, *, intraday: bool = False) -> str:
+    if data.empty:
+        return "기준없음"
+    if intraday:
+        return "분봉"
+    return "일봉"
+
+
 def _max_age_for_interval(interval: str) -> int:
     return 3 if str(interval).lower() in {"1d", "1wk", "1mo"} else 1
 

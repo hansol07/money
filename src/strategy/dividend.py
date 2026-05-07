@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.data.fetch import get_stock_data, get_stock_dividend_details, is_recent_price_data
+from src.data.fetch import (
+    get_stock_data,
+    get_stock_dividend_details,
+    is_recent_price_data,
+    latest_price_timestamp,
+    price_data_freshness_label,
+    price_source_label,
+)
 from src.strategy.universe import get_dividend_universe
 
 
@@ -139,6 +146,7 @@ def build_dividend_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
                 continue
 
             latest = data.iloc[-1]
+            latest_ts = latest_price_timestamp(data)
             zone_low, zone_high = _build_accumulate_zone(latest)
             close_price = float(latest["Close"])
             action = _build_action(close_price, zone_low, zone_high, str(details["ex_dividend_date"]))
@@ -151,6 +159,9 @@ def build_dividend_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
                 "ticker": item["ticker"],
                 "name": item["name"],
                 "current_price": round(close_price, 2),
+                "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+                "data_freshness": price_data_freshness_label(data, intraday=False),
+                "price_source": price_source_label(data, intraday=False),
                 "annual_dividend": round(float(details["annual_dividend"]), 4),
                 "dividend_yield_pct": round(dividend_yield, 2),
                 "dividend_growth_1y_pct": round(float(details["dividend_growth_1y_pct"]), 2),
@@ -191,6 +202,9 @@ def build_dividend_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
                     "score",
                     "style",
                     "current_price",
+                    "quote_as_of",
+                    "data_freshness",
+                    "price_source",
                     "annual_dividend",
                     "dividend_yield_pct",
                     "dividend_growth_1y_pct",

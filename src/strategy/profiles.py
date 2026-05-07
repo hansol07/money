@@ -7,10 +7,13 @@ import pandas as pd
 from src.data.fetch import (
     get_intraday_stock_data,
     is_recent_price_data,
+    latest_price_timestamp,
     get_stock_data,
     get_stock_dividend_yield,
     get_stock_event_summary,
     get_stock_news_summary,
+    price_data_freshness_label,
+    price_source_label,
 )
 from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
 from src.strategy.regime import classify_market_regime
@@ -198,11 +201,15 @@ def build_strategy_profiles(market: str, top_n: int = 8) -> dict[str, pd.DataFra
             stable_score, stable_reasons, volatility, drawdown = _stable_score(data, dividend_yield)
             dividend_score, dividend_reasons = _dividend_score(data, dividend_yield)
             growth_score, growth_reasons, annual_return = _growth_score(data)
+            latest_ts = latest_price_timestamp(data)
 
             base = {
                 "ticker": item["ticker"],
                 "name": item["name"],
                 "current_price": round(float(latest["Close"]), 2),
+                "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+                "data_freshness": price_data_freshness_label(data, intraday=False),
+                "price_source": price_source_label(data, intraday=False),
                 "dividend_yield_pct": round(dividend_yield, 2),
                 "volatility_pct": round(volatility, 2),
                 "drawdown_pct": round(drawdown, 2),
@@ -273,6 +280,7 @@ def build_short_term_trade_candidates(
                 continue
             diagnostics["daily_pass"] += 1
             daily_latest = daily.iloc[-1]
+            daily_ts = latest_price_timestamp(daily)
             close = float(daily_latest.get("Close", 0) or 0)
             atr = float(daily_latest.get("atr14", 0) or 0)
             atr_floor = max(atr, close * 0.025)
@@ -299,6 +307,10 @@ def build_short_term_trade_candidates(
                         "setup": "일봉예비",
                         "score": daily_score,
                         "entry_price": round(close, 2),
+                        "current_price": round(close, 2),
+                        "quote_as_of": daily_ts.strftime("%Y-%m-%d") if daily_ts is not None else "",
+                        "data_freshness": price_data_freshness_label(daily, intraday=False),
+                        "price_source": price_source_label(daily, intraday=False),
                         "stop_loss": round(max(0.01, close - atr_floor * 1.2), 2),
                         "target_1": round(close + atr_floor * 1.8, 2),
                         "target_2": round(close + atr_floor * 2.8, 2),
@@ -330,6 +342,7 @@ def build_short_term_trade_candidates(
 
             daily_latest = daily.iloc[-1]
             intra_latest = intraday.iloc[-1]
+            intra_ts = latest_price_timestamp(intraday)
             event_summary = get_stock_event_summary(item["ticker"])
             news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
@@ -416,6 +429,10 @@ def build_short_term_trade_candidates(
                     "name": item["name"],
                     "setup": setup,
                     "score": score,
+                    "current_price": round(float(intra_latest["Close"]), 2),
+                    "quote_as_of": intra_ts.strftime("%Y-%m-%d %H:%M") if intra_ts is not None else "",
+                    "data_freshness": price_data_freshness_label(intraday, intraday=True),
+                    "price_source": price_source_label(intraday, intraday=True),
                     "entry_price": round(entry_price, 2),
                     "stop_loss": round(stop_loss, 2),
                     "target_1": round(target_1, 2),
@@ -464,6 +481,10 @@ def build_short_term_trade_candidates(
                     "name",
                     "setup",
                     "score",
+                    "current_price",
+                    "quote_as_of",
+                    "data_freshness",
+                    "price_source",
                     "entry_price",
                     "stop_loss",
                     "target_1",
@@ -543,6 +564,7 @@ def build_high_risk_trade_candidates(
                 continue
             diagnostics["daily_pass"] += 1
             daily_latest = daily.iloc[-1]
+            daily_ts = latest_price_timestamp(daily)
             close = float(daily_latest.get("Close", 0) or 0)
             atr = float(daily_latest.get("atr14", 0) or 0)
             atr_floor = max(atr, close * 0.04)
@@ -568,6 +590,10 @@ def build_high_risk_trade_candidates(
                         "name": item["name"],
                         "setup": "고위험일봉예비",
                         "score": daily_score,
+                        "current_price": round(close, 2),
+                        "quote_as_of": daily_ts.strftime("%Y-%m-%d") if daily_ts is not None else "",
+                        "data_freshness": price_data_freshness_label(daily, intraday=False),
+                        "price_source": price_source_label(daily, intraday=False),
                         "entry_price": round(close, 2),
                         "stop_loss": round(max(0.01, close - atr_floor * 1.0), 2),
                         "target_1": round(close + atr_floor * 2.0, 2),
@@ -601,6 +627,7 @@ def build_high_risk_trade_candidates(
 
             daily_latest = daily.iloc[-1]
             intra_latest = intraday.iloc[-1]
+            intra_ts = latest_price_timestamp(intraday)
             event_summary = get_stock_event_summary(item["ticker"])
             news_summary = get_stock_news_summary(item["ticker"])
             recent_high = float(intraday["session_high_20"].iloc[-2])
@@ -684,6 +711,10 @@ def build_high_risk_trade_candidates(
                     "name": item["name"],
                     "setup": setup,
                     "score": score,
+                    "current_price": round(float(intra_latest["Close"]), 2),
+                    "quote_as_of": intra_ts.strftime("%Y-%m-%d %H:%M") if intra_ts is not None else "",
+                    "data_freshness": price_data_freshness_label(intraday, intraday=True),
+                    "price_source": price_source_label(intraday, intraday=True),
                     "entry_price": round(entry_price, 2),
                     "stop_loss": round(stop_loss, 2),
                     "target_1": round(target_1, 2),
@@ -733,6 +764,10 @@ def build_high_risk_trade_candidates(
                     "name",
                     "setup",
                     "score",
+                    "current_price",
+                    "quote_as_of",
+                    "data_freshness",
+                    "price_source",
                     "entry_price",
                     "stop_loss",
                     "target_1",
