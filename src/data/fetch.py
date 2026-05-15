@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+import os
 from pathlib import Path
 from time import sleep
 import tempfile
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
-import yfinance as yf
 import streamlit as st
+
+
+def _clear_dead_proxy_env() -> None:
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        value = str(os.environ.get(key, "") or "")
+        if "127.0.0.1:9" in value:
+            os.environ.pop(key, None)
+
+
+_clear_dead_proxy_env()
+
+import yfinance as yf
 
 from src.indicators.technical import add_indicators
 from src.storage.sqlite_cache import (
@@ -27,6 +42,8 @@ YF_DOWNLOAD_RETRIES = 2
 # path contains non-ASCII segments, which previously forced the app onto stale
 # local stock data.
 YF_CACHE_DIR = Path(tempfile.gettempdir()) / "stock_decision_helper_yfinance_cache"
+FAILED_DOWNLOAD_COOLDOWN_SECONDS = 60 * 20
+_FAILED_DOWNLOADS: dict[tuple[str, str], pd.Timestamp] = {}
 
 
 def is_recent_price_data(data: pd.DataFrame, *, max_age_days: int = 3) -> bool:
@@ -107,6 +124,30 @@ def _warehouse_or_empty(ticker: str, interval: str, *, intraday: bool = False) -
         return stored.dropna().reset_index(drop=True)
     return add_indicators(stored)
 
+
+def _download_block_key(ticker: str, interval: str) -> tuple[str, str]:
+    return (str(ticker or "").strip().upper(), str(interval or "").strip().lower())
+
+
+def _download_recently_failed(ticker: str, interval: str) -> bool:
+    key = _download_block_key(ticker, interval)
+    failed_at = _FAILED_DOWNLOADS.get(key)
+    if failed_at is None:
+        return False
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    return (now - failed_at).total_seconds() < FAILED_DOWNLOAD_COOLDOWN_SECONDS
+
+
+def _remember_download_failure(ticker: str, interval: str) -> None:
+    _FAILED_DOWNLOADS[_download_block_key(ticker, interval)] = pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+
+def _prefer_warehouse_mode() -> bool:
+    try:
+        return bool(st.session_state.get("prefer_price_warehouse", True))
+    except Exception:
+        return True
+
 try:
     YF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if hasattr(yf, "set_tz_cache_location"):
@@ -118,6 +159,7 @@ except Exception:
 
 
 def _download_yf(ticker: str, **kwargs: object) -> pd.DataFrame:
+    _clear_dead_proxy_env()
     last_error: Exception | None = None
     for attempt in range(YF_DOWNLOAD_RETRIES):
         try:
@@ -136,6 +178,64 @@ def _download_yf(ticker: str, **kwargs: object) -> pd.DataFrame:
     if last_error is not None:
         raise last_error
     return pd.DataFrame()
+
+
+def _download_yahoo_chart(
+    ticker: str,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    period: str | None = None,
+    interval: str = "1d",
+) -> pd.DataFrame:
+    _clear_dead_proxy_env()
+    params: dict[str, object] = {
+        "interval": interval,
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+    if period:
+        params["range"] = period
+    else:
+        if start is None or end is None:
+            return pd.DataFrame()
+        params["period1"] = int(start.timestamp())
+        params["period2"] = int(end.timestamp())
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?{urlencode(params)}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    try:
+        with urlopen(request, timeout=max(12, YF_DOWNLOAD_TIMEOUT + 4)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return pd.DataFrame()
+
+    result = ((payload.get("chart") or {}).get("result") or [])
+    if not result:
+        return pd.DataFrame()
+    item = result[0]
+    timestamps = item.get("timestamp") or []
+    quote = (((item.get("indicators") or {}).get("quote") or [{}])[0]) or {}
+    if not timestamps or not quote:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(timestamps, unit="s", errors="coerce"),
+            "Open": quote.get("open") or [],
+            "High": quote.get("high") or [],
+            "Low": quote.get("low") or [],
+            "Close": quote.get("close") or [],
+            "Volume": quote.get("volume") or [],
+        }
+    )
+    return frame[["Date", "Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Date", "Close"])
 
 
 def _cache_only_mode() -> bool:
@@ -191,6 +291,42 @@ def _quote_is_recent(quote: dict[str, object]) -> bool:
     return (now - pd.Timestamp(ts)).days <= max_age_days
 
 
+def _quote_from_warehouse(ticker: str) -> dict[str, object] | None:
+    intraday = _warehouse_or_empty(ticker, "5m", intraday=True)
+    if not intraday.empty and is_recent_price_data(intraday, max_age_days=1):
+        current_price = float(intraday["Close"].iloc[-1])
+        as_of = latest_price_timestamp(intraday)
+        prev_close = None
+        change_pct = None
+        daily = _warehouse_or_empty(ticker, "1d", intraday=False)
+        if not daily.empty and len(daily) >= 2:
+            prev_close = float(daily["Close"].iloc[-2])
+            if prev_close > 0:
+                change_pct = (current_price - prev_close) / prev_close * 100
+        return {
+            "current_price": round(current_price, 4),
+            "prev_close": round(prev_close, 4) if prev_close is not None else None,
+            "change_pct": round(change_pct, 2) if change_pct is not None else None,
+            "as_of": pd.Timestamp(as_of).strftime("%Y-%m-%d %H:%M") if as_of is not None else "",
+            "source": "5m-db",
+        }
+
+    daily = _warehouse_or_empty(ticker, "1d", intraday=False)
+    if daily.empty or not is_recent_price_data(daily, max_age_days=3):
+        return None
+    current_price = float(daily["Close"].iloc[-1])
+    prev_close = float(daily["Close"].iloc[-2]) if len(daily) >= 2 else None
+    change_pct = ((current_price - prev_close) / prev_close * 100) if prev_close and prev_close > 0 else None
+    as_of = latest_price_timestamp(daily)
+    return {
+        "current_price": round(current_price, 4),
+        "prev_close": round(prev_close, 4) if prev_close is not None else None,
+        "change_pct": round(change_pct, 2) if change_pct is not None else None,
+        "as_of": pd.Timestamp(as_of).strftime("%Y-%m-%d") if as_of is not None else "",
+        "source": "1d-db",
+    }
+
+
 def _classify_event_risk(*values: object) -> str:
     has_medium = False
     for value in values:
@@ -229,7 +365,17 @@ def get_stock_data(ticker: str, period: str = "5y", interval: str = "1d") -> pd.
     if cached is not None and not cached.empty and is_recent_price_data(cached, max_age_days=max_age_days):
         set_price_bars(ticker, interval, cached, source="streamlit_cache")
         return cached
+    if _prefer_warehouse_mode():
+        warehouse = _warehouse_or_empty(ticker, interval, intraday=False)
+        if not warehouse.empty and is_recent_price_data(warehouse, max_age_days=max_age_days):
+            set_cached_frame(cache_key, warehouse, ttl_seconds=60 * 60 * 2)
+            return warehouse
     if _cache_only_mode():
+        warehouse = _warehouse_or_empty(ticker, interval, intraday=False)
+        if not warehouse.empty:
+            return warehouse
+        return _stale_frame_or_empty(cache_key, date_columns=["Date"])
+    if _download_recently_failed(ticker, interval):
         warehouse = _warehouse_or_empty(ticker, interval, intraday=False)
         if not warehouse.empty:
             return warehouse
@@ -238,23 +384,28 @@ def get_stock_data(ticker: str, period: str = "5y", interval: str = "1d") -> pd.
     end = datetime.utcnow()
     start = end - timedelta(days=365 * 5 + 30)
 
-    try:
-        df = _download_yf(
-            ticker,
-            start=start,
-            end=end,
-            interval=interval,
-        )
-    except Exception:
-        return _stale_frame_or_empty(cache_key, date_columns=["Date"])
+    df = _download_yahoo_chart(ticker, start=start, end=end, interval=interval)
 
     if df.empty:
+        try:
+            df = _download_yf(
+                ticker,
+                start=start,
+                end=end,
+                interval=interval,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
+    if df.empty:
+        _remember_download_failure(ticker, interval)
         return _stale_frame_or_empty(cache_key, date_columns=["Date"])
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = df.rename_axis("Date").reset_index()
+    if "Date" not in df.columns:
+        df = df.rename_axis("Date").reset_index()
     df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].dropna()
     result = add_indicators(df)
     set_cached_frame(cache_key, result, ttl_seconds=60 * 60 * 6)
@@ -279,28 +430,43 @@ def get_intraday_stock_data(
         cache_for_bars = cached.rename(columns={"Datetime": "Date"}) if "Datetime" in cached.columns else cached
         set_price_bars(ticker, interval, cache_for_bars, source="streamlit_cache")
         return cached
+    if not force_refresh and _prefer_warehouse_mode():
+        warehouse = _warehouse_or_empty(ticker, interval, intraday=True)
+        if not warehouse.empty and is_recent_price_data(warehouse, max_age_days=1):
+            set_cached_frame(cache_key, warehouse, ttl_seconds=120)
+            return warehouse
     if _cache_only_mode():
         warehouse = _warehouse_or_empty(ticker, interval, intraday=True)
         if not warehouse.empty:
             return warehouse
         return _stale_frame_or_empty(cache_key, date_columns=["Datetime"])
-
-    try:
-        df = _download_yf(
-            ticker,
-            period=period,
-            interval=interval,
-        )
-    except Exception:
+    if not force_refresh and _download_recently_failed(ticker, interval):
+        warehouse = _warehouse_or_empty(ticker, interval, intraday=True)
+        if not warehouse.empty:
+            return warehouse
         return _stale_frame_or_empty(cache_key, date_columns=["Datetime"])
 
+    df = _download_yahoo_chart(ticker, period=period, interval=interval)
+
     if df.empty:
+        try:
+            df = _download_yf(
+                ticker,
+                period=period,
+                interval=interval,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
+    if df.empty:
+        _remember_download_failure(ticker, interval)
         return _stale_frame_or_empty(cache_key, date_columns=["Datetime"])
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = df.rename_axis("Datetime").reset_index()
+    if "Datetime" not in df.columns and "Date" not in df.columns:
+        df = df.rename_axis("Datetime").reset_index()
     time_column = "Datetime" if "Datetime" in df.columns else "Date"
     df = df.rename(columns={time_column: "Datetime"})
     df = df[["Datetime", "Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -336,7 +502,17 @@ def get_latest_quote(ticker: str, force_refresh: bool = False) -> dict[str, obje
     cached = None if force_refresh else get_cached_json(cache_key)
     if cached is not None and _quote_is_recent(cached):
         return cached
+    if not force_refresh and _prefer_warehouse_mode():
+        warehouse_quote = _quote_from_warehouse(ticker)
+        if warehouse_quote is not None:
+            set_cached_json(cache_key, warehouse_quote, ttl_seconds=90)
+            return warehouse_quote
     if _cache_only_mode():
+        return _stale_json_or_default(cache_key, empty_result)
+    if not force_refresh and _download_recently_failed(ticker, "quote"):
+        warehouse_quote = _quote_from_warehouse(ticker)
+        if warehouse_quote is not None:
+            return warehouse_quote
         return _stale_json_or_default(cache_key, empty_result)
 
     try:
@@ -346,6 +522,7 @@ def get_latest_quote(ticker: str, force_refresh: bool = False) -> dict[str, obje
             interval="5m",
         )
     except Exception:
+        _remember_download_failure(ticker, "quote")
         intraday = pd.DataFrame()
 
     if not intraday.empty:
@@ -393,9 +570,11 @@ def get_latest_quote(ticker: str, force_refresh: bool = False) -> dict[str, obje
             interval="1d",
         )
     except Exception:
+        _remember_download_failure(ticker, "quote")
         daily = pd.DataFrame()
 
     if daily.empty:
+        _remember_download_failure(ticker, "quote")
         return _stale_json_or_default(cache_key, empty_result)
 
     if isinstance(daily.columns, pd.MultiIndex):

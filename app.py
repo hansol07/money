@@ -42,7 +42,13 @@ from src.storage.local_store import (
     save_portfolio,
     save_watchlists,
 )
-from src.storage.sqlite_cache import clear_sqlite_cache, get_cache_key_status, get_price_warehouse_stats, get_sqlite_cache_stats
+from src.storage.sqlite_cache import (
+    clear_sqlite_cache,
+    get_cache_key_status,
+    get_price_warehouse_stats,
+    get_price_warehouse_tickers,
+    get_sqlite_cache_stats,
+)
 from src.strategy.auto_candidates import build_auto_candidate_sets, build_compounder_candidates
 from src.strategy.dividend import build_dividend_profiles
 from src.strategy.learning import apply_context_adjustment, build_learning_adjustments
@@ -50,7 +56,7 @@ from src.strategy.profiles import build_high_risk_trade_candidates, build_short_
 from src.strategy.regime import classify_market_regime
 from src.strategy.recommendation import analyze_position
 from src.strategy.realtime import scan_intraday_market
-from src.strategy.scanner import scan_market
+from src.strategy.scanner import scan_market, scan_market_fast_db
 from src.strategy.tracker import evaluate_scan_history
 from src.strategy.universe import get_default_watchlists, get_market_sweep_universe, is_tradable_ticker, normalize_watchlist_frame
 from src.ui.charts import build_price_chart
@@ -91,7 +97,7 @@ def _inject_ui_style() -> None:
         }
         .block-container {
             max-width: 1480px;
-            padding-top: 2.6rem;
+            padding-top: 4.2rem;
             padding-bottom: 3rem;
             overflow: visible;
         }
@@ -136,11 +142,15 @@ def _inject_ui_style() -> None:
             margin-bottom: 0.35rem;
         }
         div[role="radiogroup"] {
+            display: flex;
             gap: 0.5rem;
             padding: 0.2rem 0 0.6rem 0;
             flex-wrap: wrap;
         }
         div[role="radiogroup"] label {
+            display: inline-flex;
+            min-height: 2.4rem;
+            align-items: center;
             border: 1px solid var(--line);
             border-radius: 999px;
             padding: 0.38rem 0.8rem;
@@ -465,6 +475,18 @@ SCAN_PRESETS: dict[str, dict[str, object]] = {
         "interval": "1m",
     },
 }
+
+PRESET_DISPLAY_NAMES: dict[str, str] = {
+    "빠른 확인": "빠른 스캔",
+    "균형 추천": "균형 스캔",
+    "깊게 탐색": "정밀 스캔",
+    "공격 단타": "공격 단타",
+}
+
+
+def _preset_label(preset_name: str) -> str:
+    return PRESET_DISPLAY_NAMES.get(str(preset_name), str(preset_name))
+
 
 FULL_COLLECTION_STATE_FILE = Path(__file__).resolve().parent / "data" / "full_collection_state.json"
 
@@ -1486,6 +1508,7 @@ def init_state() -> None:
         }
     st.session_state.setdefault("active_scan_preset", st.session_state.get("scan_preset", "균형 추천"))
     st.session_state.setdefault("cache_only_mode", False)
+    st.session_state.setdefault("prefer_price_warehouse", True)
 
 
 @st.cache_resource
@@ -1510,6 +1533,7 @@ def render_sidebar() -> tuple[str, str]:
         if st.session_state.get("active_scan_preset", "균형 추천") in SCAN_PRESETS
         else 1,
         key="scan_preset_select",
+        format_func=_preset_label,
     )
     if st.sidebar.button("프리셋 적용", width="stretch"):
         preset = SCAN_PRESETS[preset_name]
@@ -1522,9 +1546,14 @@ def render_sidebar() -> tuple[str, str]:
         st.session_state.realtime_settings["interval"] = str(preset["interval"])
         get_today_scan_state.clear()
         get_auto_candidate_sets_state.clear()
-        st.sidebar.success(f"{preset_name} 모드를 적용했습니다.")
+        st.sidebar.success(f"{_preset_label(preset_name)} 모드를 적용했습니다.")
         st.rerun()
-    st.sidebar.caption("빠른 확인은 가볍게, 깊게 탐색은 넓게, 공격 단타는 분봉 민감도를 올립니다.")
+    st.sidebar.caption("빠른 스캔은 즉시 확인, 정밀 스캔은 후보 폭 확대, 공격 단타는 분봉 민감도를 올립니다.")
+    st.session_state["prefer_price_warehouse"] = st.sidebar.toggle(
+        "로컬 DB 우선 빠른 조회",
+        value=bool(st.session_state.get("prefer_price_warehouse", True)),
+        help="켜두면 저장된 가격 DB로 먼저 빠르게 후보를 만들고, 부족할 때만 온라인 조회를 보조로 씁니다.",
+    )
     online_lookup = st.sidebar.toggle(
         "온라인 새 데이터 조회",
         value=not bool(st.session_state.get("cache_only_mode", False)),
@@ -1614,21 +1643,21 @@ def render_sidebar() -> tuple[str, str]:
         readiness_limit = int(st.session_state.scanner_settings["market_sweep_limit"])
         us_ready = _daily_cache_readiness("US", readiness_limit)
         kr_ready = _daily_cache_readiness("KR", readiness_limit)
-        st.write(f"시세/프로필 캐시: {db_stats['cache_entries']:,}개")
-        st.write(f"만료되어 추천 차단: {db_stats['expired_cache_entries']:,}개")
+        st.write(f"저장 데이터: {db_stats['cache_entries']:,}개")
+        st.write(f"오래되어 추천 제외: {db_stats['expired_cache_entries']:,}개")
         st.write(f"스냅샷: {db_stats['scan_snapshots']:,}개")
         st.write(f"피처 로그: {db_stats['feature_entries']:,}개")
         st.write(f"가격 원본 바: {int(db_stats.get('price_bars', 0) or 0):,}개")
         st.write(f"가격 저장 종목: {int(db_stats.get('price_tickers', 0) or 0):,}개")
         st.write(f"시장 탐색 유니버스: US {us_sweep_count:,}개 / KR {kr_sweep_count:,}개")
         st.write(f"DB 크기: {db_stats['db_size_mb']:.2f} MB")
-        st.caption(f"현재 탐색 수 {readiness_limit:,}개 기준 최신 데이터 준비도입니다. 만료 캐시는 추천에 쓰지 않습니다.")
+        st.caption(f"현재 탐색 수 {readiness_limit:,}개 기준 최신 데이터 준비도입니다. 오래된 데이터는 추천에서 제외합니다.")
         for ready in [us_ready, kr_ready]:
             progress_value = min(1.0, max(0.0, float(ready["coverage_pct"]) / 100))
             st.progress(progress_value)
             st.caption(
                 f"{ready['market']} {ready['label']} · 추천 가능 {int(ready['usable']):,}/{int(ready['total']):,}개 "
-                f"(신선 {int(ready['fresh']):,}, 만료 {int(ready['stale']):,}, 없음 {int(ready['missing']):,})"
+                f"(최신 {int(ready['fresh']):,}, 오래됨 {int(ready['stale']):,}, 미수집 {int(ready['missing']):,})"
             )
         warehouse_stats = get_price_warehouse_stats()
         if not warehouse_stats.empty:
@@ -1652,22 +1681,22 @@ def render_sidebar() -> tuple[str, str]:
             except Exception as exc:
                 st.warning(str(exc))
         warm_limit = st.number_input(
-            "일봉 캐시 예열 수",
+            "일봉 데이터 수집 수",
             min_value=10,
             max_value=300,
             value=min(300, max(50, readiness_limit)),
             step=10,
-            help="시장 탐색 앞쪽 종목의 일봉 데이터를 미리 받아 단타/예산 스캔을 덜 답답하게 만듭니다.",
+            help="시장 탐색 앞쪽 종목의 일봉 데이터를 미리 받아 단타/예산 스캔을 빠르게 만듭니다.",
         )
-        if st.button("일봉 캐시 예열", width="stretch"):
-            with st.spinner("US/KR 일봉 캐시를 채우는 중입니다. 첫 실행은 시간이 걸릴 수 있습니다."):
+        if st.button("일봉 데이터 수집", width="stretch"):
+            with st.spinner("US/KR 일봉 데이터를 수집하는 중입니다. 첫 실행은 시간이 걸릴 수 있습니다."):
                 counts = _warm_daily_cache(int(warm_limit))
-            st.success(f"캐시 예열 완료: US {counts['US']:,}개 / KR {counts['KR']:,}개")
+            st.success(f"데이터 수집 완료: US {counts['US']:,}개 / KR {counts['KR']:,}개")
 
     return market, ticker
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_resource(ttl=1800, show_spinner=False)
 def get_learning_state() -> tuple[
     dict[tuple[str, str, str], object],
     pd.DataFrame,
@@ -1732,10 +1761,10 @@ def _daily_cache_readiness(market: str, limit: int) -> dict[str, object]:
         action = "넓게 돌려도 체감 속도가 좋습니다."
     elif coverage_pct >= 35:
         label = "부분 준비"
-        action = "조금만 예열하면 단타/예산 플랜이 더 빨라집니다."
+        action = "부족한 데이터를 조금만 수집하면 단타/예산 플랜이 더 빨라집니다."
     else:
-        label = "예열 권장"
-        action = "첫 넓은 탐색은 느릴 수 있어 일봉 캐시 예열을 추천합니다."
+        label = "데이터 수집 권장"
+        action = "첫 넓은 탐색은 느릴 수 있어 일봉 데이터 수집을 추천합니다."
     return {
         "market": market,
         "label": label,
@@ -1847,6 +1876,34 @@ def _render_data_freshness_gate(*, purpose: str, require_intraday: bool = False)
     return has_usable_market
 
 
+def _has_any_price_warehouse_data(*, require_intraday: bool = False) -> bool:
+    stats = get_price_warehouse_stats()
+    if stats.empty:
+        return False
+    intervals = stats.get("interval", pd.Series(dtype=object)).astype(str).str.lower()
+    if require_intraday:
+        return bool(intervals.isin(["1m", "2m", "5m", "15m", "30m", "60m", "90m"]).any())
+    return bool((intervals == "1d").any())
+
+
+def _render_data_warning_or_gate(*, purpose: str, require_intraday: bool = False) -> bool:
+    if _render_data_freshness_gate(purpose=purpose, require_intraday=require_intraday):
+        st.session_state["degraded_price_mode"] = False
+        return True
+
+    if _has_any_price_warehouse_data(require_intraday=require_intraday):
+        st.session_state["degraded_price_mode"] = True
+        data_kind = "분봉" if require_intraday else "일봉"
+        st.warning(
+            f"{purpose}: 온라인 최신성 검사는 통과하지 못했지만, 로컬 DB에 저장된 {data_kind} 데이터로 후보를 먼저 보여줍니다. "
+            "표의 기준시각과 증권사 현재가를 반드시 같이 확인하세요."
+        )
+        return True
+
+    st.session_state["degraded_price_mode"] = False
+    return False
+
+
 def _audit_market_data_sample(market: str, limit: int = 80) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for item in get_market_sweep_universe(market)[: max(1, int(limit))]:
@@ -1917,16 +1974,16 @@ def _recommend_scan_preset(readiness: dict[str, object], *, purpose: str) -> tup
 
     if purpose == "short_term":
         if coverage >= 82 and missing <= 120:
-            return "공격 단타", "캐시가 충분해서 분봉 민감도를 올리고 넓게 훑어도 괜찮습니다."
+            return "공격 단타", "저장 데이터가 충분해서 분봉 민감도를 올리고 넓게 훑어도 괜찮습니다."
         if coverage >= 50:
-            return "균형 추천", "일봉 후보 압축은 빠르게 가능하지만, 분봉 조회는 적당히 제한하는 편이 좋습니다."
-        return "빠른 확인", "첫 단타 스캔은 느릴 수 있어 작은 범위로 감을 잡는 편이 안전합니다."
+            return "균형 추천", "일봉 후보 압축은 가능하지만, 분봉 조회는 적당히 제한하는 편이 좋습니다."
+        return "빠른 확인", "첫 단타 스캔은 느릴 수 있어 작은 범위로 먼저 확인하는 편이 안전합니다."
 
     if coverage >= 82 and fresh_pct >= 15:
         return "깊게 탐색", "저장 데이터가 충분해 예산 플랜 후보군을 넓게 보는 쪽이 좋습니다."
     if coverage >= 45:
         return "균형 추천", "속도와 탐색 폭의 균형이 좋아 예산 플랜 기본값으로 적합합니다."
-    return "빠른 확인", "캐시가 아직 얕아서 먼저 빠르게 후보를 보고 필요한 만큼 예열하는 편이 좋습니다."
+    return "빠른 확인", "저장 데이터가 아직 적어서 먼저 빠르게 후보를 보고 필요한 만큼 추가 수집하는 편이 좋습니다."
 
 
 def _apply_scan_preset(preset_name: str) -> None:
@@ -1949,20 +2006,20 @@ def _render_scan_advisor(*, purpose: str, key_prefix: str) -> dict[str, object]:
     current = str(st.session_state.get("active_scan_preset", "균형 추천"))
     tone = st.success if recommended == current else st.info
     tone(
-        f"추천 실행 모드: `{recommended}` · 현재 `{current}` · "
+        f"스캔 설정: `{_preset_label(recommended)}` 추천 · 현재 `{_preset_label(current)}` · "
         f"최신 데이터 준비도 {float(readiness['coverage_pct']):.0f}% "
-        f"({int(readiness['fresh']):,}/{int(readiness['total']):,}개 추천 가능). {reason}"
+        f"({int(readiness['fresh']):,}/{int(readiness['total']):,}개 사용 가능). {reason}"
     )
     metric_cols = st.columns(4)
-    metric_cols[0].metric("최신 준비도", f"{float(readiness['coverage_pct']):.0f}%")
-    metric_cols[1].metric("신선 캐시", f"{int(readiness['fresh']):,}")
-    metric_cols[2].metric("오래됨 차단", f"{int(readiness['stale']):,}")
-    metric_cols[3].metric("예열 필요", f"{int(readiness['missing']):,}")
+    metric_cols[0].metric("최신 데이터 비율", f"{float(readiness['coverage_pct']):.0f}%")
+    metric_cols[1].metric("최신 데이터", f"{int(readiness['fresh']):,}")
+    metric_cols[2].metric("오래된 데이터", f"{int(readiness['stale']):,}")
+    metric_cols[3].metric("미수집 데이터", f"{int(readiness['missing']):,}")
 
     action_cols = st.columns(2)
     with action_cols[0]:
         if recommended != current and st.button(
-            f"{recommended} 모드로 맞추기",
+            f"{_preset_label(recommended)}로 맞추기",
             key=f"{key_prefix}_apply_recommended_preset",
             width="stretch",
         ):
@@ -1971,13 +2028,13 @@ def _render_scan_advisor(*, purpose: str, key_prefix: str) -> dict[str, object]:
     warm_count = min(300, max(50, int(readiness.get("missing", 0) or 0) // 2))
     with action_cols[1]:
         if int(readiness.get("missing", 0) or 0) > 0 and st.button(
-            f"부족 캐시 {warm_count}개 예열",
+            f"부족 데이터 {warm_count}개 수집",
             key=f"{key_prefix}_warm_missing_cache",
             width="stretch",
         ):
-            with st.spinner(f"US/KR 각 {warm_count:,}개까지 일봉 캐시를 예열하는 중입니다."):
+            with st.spinner(f"US/KR 각 {warm_count:,}개까지 일봉 데이터를 수집하는 중입니다."):
                 counts = _warm_daily_cache(warm_count)
-            st.success(f"예열 완료: US {counts['US']:,}개 / KR {counts['KR']:,}개")
+            st.success(f"데이터 수집 완료: US {counts['US']:,}개 / KR {counts['KR']:,}개")
             st.rerun()
     return readiness
 
@@ -2284,6 +2341,65 @@ def _watchlist_cache_key(market: str) -> tuple[tuple[str, str], ...]:
     )
 
 
+def _market_scan_cache_key(
+    market: str,
+    limit: int,
+    *,
+    include_warehouse: bool = True,
+) -> tuple[tuple[str, str], ...]:
+    max_items = max(1, int(limit))
+    market_code = str(market).upper()
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(ticker: object, name: object = "") -> None:
+        symbol = str(ticker or "").strip().upper()
+        if not symbol or symbol in seen or not is_tradable_ticker(symbol):
+            return
+        seen.add(symbol)
+        rows.append((symbol, str(name or "")))
+
+    universe = get_market_sweep_universe(market_code)
+    name_lookup = {
+        str(item.get("ticker", "") or "").strip().upper(): str(item.get("name", "") or "")
+        for item in universe
+    }
+    name_lookup.update(
+        {
+            str(item.get("ticker", "") or "").strip().upper(): str(item.get("name", "") or "")
+            for item in st.session_state.watchlists.get(market_code, [])
+        }
+    )
+
+    if include_warehouse:
+        warehouse = get_price_warehouse_tickers(market_code, interval="1d")
+        if not warehouse.empty:
+            for _, row in warehouse.iterrows():
+                ticker = str(row.get("ticker", "") or "").strip().upper()
+                _add(ticker, name_lookup.get(ticker, ""))
+                if len(rows) >= max_items:
+                    return tuple(rows)
+
+    for item in st.session_state.watchlists.get(market_code, []):
+        _add(item.get("ticker", ""), item.get("name", ""))
+        if len(rows) >= max_items:
+            return tuple(rows)
+    for item in universe:
+        _add(item.get("ticker", ""), item.get("name", ""))
+        if len(rows) >= max_items:
+            return tuple(rows)
+
+    return tuple(rows)
+
+
+def _scan_candidate_key(market: str, limit: int) -> tuple[tuple[str, str], ...]:
+    return _market_scan_cache_key(
+        market,
+        limit,
+        include_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
+    )
+
+
 def _portfolio_cache_key(portfolio: pd.DataFrame) -> tuple[tuple[object, ...], ...]:
     if portfolio.empty:
         return tuple()
@@ -2345,20 +2461,35 @@ def get_today_scan_state(
     watchlist_key: tuple[tuple[str, str], ...],
     min_score: int,
     scan_limit: int,
+    fast_mode: bool = True,
+    prefer_warehouse: bool = True,
 ) -> pd.DataFrame:
     watchlist = [{"ticker": ticker, "name": name} for ticker, name in watchlist_key][: max(1, int(scan_limit))]
     learning_adjustments, _, event_adjustments, news_adjustments, _ = get_learning_state()
     _, _, _, _, pattern_stats = get_tracking_state()
     pattern_lookup = _build_pattern_lookup(pattern_stats)
-    scan = scan_market(
-        market,
-        watchlist,
-        min_score=min_score,
-        learning_adjustments=learning_adjustments,
-        event_adjustments=event_adjustments,
-        news_adjustments=news_adjustments,
-    )
+    use_fast_db = bool(fast_mode and prefer_warehouse)
+    if use_fast_db:
+        scan = scan_market_fast_db(market, watchlist, min_score=min_score)
+        if scan.empty:
+            scan = scan_market_fast_db(market, watchlist, min_score=max(50, int(min_score) - 15))
+    else:
+        scan = pd.DataFrame()
+
+    if scan.empty:
+        scan = scan_market(
+            market,
+            watchlist,
+            min_score=min_score,
+            learning_adjustments=learning_adjustments,
+            event_adjustments=event_adjustments,
+            news_adjustments=news_adjustments,
+            include_context=not fast_mode,
+            include_learning=not fast_mode,
+        )
     scan = _enrich_recommendation_frame(scan, scan_type="today_scan", market=market, pattern_lookup=pattern_lookup)
+    if use_fast_db:
+        return scan
     return _attach_latest_quotes(scan, default_market=market)
 
 
@@ -3897,9 +4028,10 @@ def _collect_daily_recommendation_snapshots() -> pd.DataFrame:
     for market in ["US", "KR"]:
         today = get_today_scan_state(
             market=market,
-            watchlist_key=_watchlist_cache_key(market),
+            watchlist_key=_scan_candidate_key(market, today_limit),
             min_score=min_score,
             scan_limit=today_limit,
+            prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
         )
         today_frames[market] = today
         saved = _remember_recommendation_snapshot("today_scan", market, today)
@@ -5418,11 +5550,11 @@ def render_budget_planner() -> None:
 
     _render_decision_log_overview(compact=True)
 
-    if not _render_data_freshness_gate(purpose="예산 플래너", require_intraday=False):
+    if not _render_data_warning_or_gate(purpose="예산 플래너", require_intraday=False):
         st.info("오래된 가격으로 예산 배분을 만들지 않도록 계산을 멈췄습니다.")
         return
 
-    st.markdown("#### 실행 모드 제안")
+    st.markdown("#### 스캔 설정")
     _render_scan_advisor(purpose="budget", key_prefix="budget")
 
     calc_col, scan_col, deep_col, hint_col = st.columns([1, 1, 1, 2])
@@ -5437,7 +5569,7 @@ def render_budget_planner() -> None:
         affordable_limit = 300 if deep_budget_search else 80
         st.caption(
             f"예산맞춤 후보는 기본 시장별 `{affordable_limit}`개만 확인합니다. "
-            "느리면 깊게 탐색을 끄고, 전체 수집은 대시보드에서 따로 돌리세요."
+            "느리면 정밀 탐색을 끄고, 전체 수집은 대시보드에서 따로 돌리세요."
         )
 
     if float(us_budget) + float(kr_budget) <= 0:
@@ -5503,15 +5635,17 @@ def render_budget_planner() -> None:
         kr_candidates = _merge_budget_affordable_candidates(kr_candidates, kr_affordable)
         us_common = get_today_scan_state(
             market="US",
-            watchlist_key=_watchlist_cache_key("US"),
+            watchlist_key=_scan_candidate_key("US", min(12, int(st.session_state.scanner_settings["scan_limit"]))),
             min_score=int(st.session_state.scanner_settings["min_score"]),
             scan_limit=min(12, int(st.session_state.scanner_settings["scan_limit"])),
+            prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
         )
         kr_common = get_today_scan_state(
             market="KR",
-            watchlist_key=_watchlist_cache_key("KR"),
+            watchlist_key=_scan_candidate_key("KR", min(12, int(st.session_state.scanner_settings["scan_limit"]))),
             min_score=int(st.session_state.scanner_settings["min_score"]),
             scan_limit=min(12, int(st.session_state.scanner_settings["scan_limit"])),
+            prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
         )
         us_candidates = _merge_common_recommendations_for_budget(us_candidates, us_common, budget=float(us_budget))
         kr_candidates = _merge_common_recommendations_for_budget(kr_candidates, kr_common, budget=float(kr_budget))
@@ -5549,7 +5683,7 @@ def render_budget_planner() -> None:
         progress.progress(1.0, text="예산 플랜 계산 완료")
     st.success("예산 플랜 계산 완료")
     if not include_live_candidates:
-        st.caption("빠른 모드: 저장된 스냅샷과 로컬 가격 캐시에서 예산 안에 들어오는 후보를 먼저 찾습니다. 최신 시장 후보까지 보려면 `시장 전체 새 탐색`을 켜세요.")
+        st.caption("빠른 모드: 저장된 스냅샷과 로컬 가격 DB에서 예산 안에 들어오는 후보를 먼저 찾습니다. 최신 시장 후보까지 보려면 `시장 전체 새 탐색`을 켜세요.")
     st.caption("추천 일치 기준: 예산 플래너도 오늘 추천 탭의 공통추천을 먼저 사용하고, 예산으로 1주 매수가 어려울 때만 예산맞춤 후보를 보조로 섞습니다.")
     if float(us_budget) > 0:
         st.caption(f"미국 예산 맞춤 로컬 후보: {len(us_affordable)}개")
@@ -5611,60 +5745,75 @@ def render_budget_planner() -> None:
                 remembered_markets.append(market_name)
         if remembered_markets:
             st.caption(f"학습 메모리 저장: {', '.join(remembered_markets)} 예산 플랜을 오늘 결과 추적 대상으로 기록했습니다.")
-        _render_action_deck(combined_actions, title="오늘 바로 실행 카드", limit=4)
-        execution_view = _budget_actions_execution_view(combined_actions)
-        _show_table(
-            execution_view,
-            plain_numeric_columns=["planned_amount", "executable_amount", "reserve_amount"],
-            currency_columns=[
-                "current_price",
-                "entry_price",
-                "stop_loss",
-                "target_1",
-                "target_2",
-                "target_3",
-            ],
-            column_config={
-                "market": st.column_config.TextColumn("시장", width="small"),
-                "bucket": st.column_config.TextColumn("유형", width="small"),
-                "ticker": st.column_config.TextColumn("티커", width="small"),
-                "name": st.column_config.TextColumn("종목명", width="small"),
-                "entry_decision": st.column_config.TextColumn("지금판단", width="small"),
-                "current_price": st.column_config.TextColumn("현재가", width="small"),
-                "entry_price": st.column_config.TextColumn("진입가", width="small"),
-                "stop_loss": st.column_config.TextColumn("손절가", width="small"),
-                "target_1": st.column_config.TextColumn("1차목표", width="small"),
-                "target_2": st.column_config.TextColumn("2차목표", width="small"),
-                "target_3": st.column_config.TextColumn("3차목표", width="small"),
-                "entry_gap_pct": st.column_config.NumberColumn("진입여유%", format="%.2f", width="small"),
-                "risk_pct": st.column_config.NumberColumn("손절폭%", format="%.2f", width="small"),
-                "estimated_units": st.column_config.NumberColumn("매수수량", format="%d", width="small"),
-                "max_units_if_all_in": st.column_config.NumberColumn("전액시수량", format="%d", width="small"),
-                "budget_use_pct": st.column_config.NumberColumn("전액활용", format="%.1f", width="small"),
-                "planned_amount": st.column_config.TextColumn("배정금액", width="small"),
-                "executable_amount": st.column_config.TextColumn("집행금액", width="small"),
-                "reserve_amount": st.column_config.TextColumn("현금보류", width="small"),
-                "score": st.column_config.NumberColumn("점수", format="%d", width="small"),
-                "confidence_score": st.column_config.NumberColumn("신뢰도", format="%d", width="small"),
-                "confidence_detail": st.column_config.TextColumn("신뢰근거", width="medium"),
-                "setup": st.column_config.TextColumn("세팅", width="small"),
-                "budget_source": st.column_config.TextColumn("추천출처", width="small"),
-                "allocation_reason": st.column_config.TextColumn("배정근거", width="large"),
-                "price_basis": st.column_config.TextColumn("가격근거", width="large"),
-                "reason": st.column_config.TextColumn("핵심 사유", width="large"),
-            },
-        )
 
-        top_actions = combined_actions.head(5)
-        st.markdown("#### 무엇부터 할까")
-        for _, row in top_actions.iterrows():
-            st.write(
-                f"- `{row['market']} {row['ticker']}` | {row['bucket']} | "
-                f"{row.get('execution_status', '상태확인')} | {row['planned_amount']:,.0f} 배정 | "
-                f"현재가 {_format_price(row.get('ref_price'), str(row.get('market', '')))} | "
-                f"진입가 {_format_price(row.get('buy_now_limit'), str(row.get('market', '')))} | "
-                f"손절가 {_format_price(row.get('stop_loss'), str(row.get('market', '')))} | {row['reason']}"
+        budget_action_column_config = {
+            "market": st.column_config.TextColumn("시장", width="small"),
+            "bucket": st.column_config.TextColumn("유형", width="small"),
+            "ticker": st.column_config.TextColumn("티커", width="small"),
+            "name": st.column_config.TextColumn("종목명", width="small"),
+            "entry_decision": st.column_config.TextColumn("지금판단", width="small"),
+            "current_price": st.column_config.TextColumn("현재가", width="small"),
+            "entry_price": st.column_config.TextColumn("진입가", width="small"),
+            "stop_loss": st.column_config.TextColumn("손절가", width="small"),
+            "target_1": st.column_config.TextColumn("1차목표", width="small"),
+            "target_2": st.column_config.TextColumn("2차목표", width="small"),
+            "target_3": st.column_config.TextColumn("3차목표", width="small"),
+            "entry_gap_pct": st.column_config.NumberColumn("진입여유%", format="%.2f", width="small"),
+            "risk_pct": st.column_config.NumberColumn("손절폭%", format="%.2f", width="small"),
+            "estimated_units": st.column_config.NumberColumn("매수수량", format="%d", width="small"),
+            "max_units_if_all_in": st.column_config.NumberColumn("전액시수량", format="%d", width="small"),
+            "budget_use_pct": st.column_config.NumberColumn("전액활용", format="%.1f", width="small"),
+            "planned_amount": st.column_config.TextColumn("배정금액", width="small"),
+            "executable_amount": st.column_config.TextColumn("집행금액", width="small"),
+            "reserve_amount": st.column_config.TextColumn("현금보류", width="small"),
+            "score": st.column_config.NumberColumn("점수", format="%d", width="small"),
+            "confidence_score": st.column_config.NumberColumn("신뢰도", format="%d", width="small"),
+            "confidence_detail": st.column_config.TextColumn("신뢰근거", width="medium"),
+            "setup": st.column_config.TextColumn("세팅", width="small"),
+            "budget_source": st.column_config.TextColumn("추천출처", width="small"),
+            "allocation_reason": st.column_config.TextColumn("배정근거", width="large"),
+            "price_basis": st.column_config.TextColumn("가격근거", width="large"),
+            "reason": st.column_config.TextColumn("핵심 사유", width="large"),
+        }
+
+        def _render_budget_market_actions(market_label: str, market_code: str) -> None:
+            market_actions = combined_actions[
+                combined_actions["market"].astype(str).str.upper() == market_code
+            ].copy()
+            if market_actions.empty:
+                st.info(f"{market_label} 예산 실행안이 없습니다.")
+                return
+            _render_action_deck(market_actions, title=f"{market_label} 바로 실행 카드", limit=4)
+            execution_view = _budget_actions_execution_view(market_actions)
+            _show_table(
+                execution_view,
+                plain_numeric_columns=["planned_amount", "executable_amount", "reserve_amount"],
+                currency_columns=[
+                    "current_price",
+                    "entry_price",
+                    "stop_loss",
+                    "target_1",
+                    "target_2",
+                    "target_3",
+                ],
+                default_market=market_code,
+                column_config=budget_action_column_config,
             )
+            st.markdown("#### 무엇부터 할까")
+            for _, row in market_actions.head(5).iterrows():
+                st.write(
+                    f"- `{row['ticker']}` | {row['bucket']} | "
+                    f"{row.get('execution_status', '상태확인')} | {row['planned_amount']:,.0f} 배정 | "
+                    f"현재가 {_format_price(row.get('ref_price'), market_code)} | "
+                    f"진입가 {_format_price(row.get('buy_now_limit'), market_code)} | "
+                    f"손절가 {_format_price(row.get('stop_loss'), market_code)} | {row['reason']}"
+                )
+
+        budget_us_tab, budget_kr_tab = st.tabs(["미국 실행안", "한국 실행안"])
+        with budget_us_tab:
+            _render_budget_market_actions("미국", "US")
+        with budget_kr_tab:
+            _render_budget_market_actions("한국", "KR")
         _render_budget_decision_panel(combined_actions)
 
     brief_left, brief_right = st.columns([1, 2])
@@ -6120,9 +6269,10 @@ def render_news_event_tab() -> None:
     for market in ["US", "KR"]:
         scan = get_today_scan_state(
             market=market,
-            watchlist_key=_watchlist_cache_key(market),
+            watchlist_key=_scan_candidate_key(market, scan_limit),
             min_score=min_score,
             scan_limit=scan_limit,
+            prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
         )
         if scan.empty:
             continue
@@ -6243,15 +6393,17 @@ def render_market_scanner() -> None:
 
     us_scan = get_today_scan_state(
         market="US",
-        watchlist_key=_watchlist_cache_key("US"),
+        watchlist_key=_scan_candidate_key("US", scan_limit),
         min_score=min_score,
         scan_limit=scan_limit,
+        prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
     )
     kr_scan = get_today_scan_state(
         market="KR",
-        watchlist_key=_watchlist_cache_key("KR"),
+        watchlist_key=_scan_candidate_key("KR", scan_limit),
         min_score=min_score,
         scan_limit=scan_limit,
+        prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
     )
 
     us_tab, kr_tab = st.tabs(["미국", "한국"])
@@ -6318,15 +6470,17 @@ def render_buy_now_panel() -> None:
 
     us_scan = get_today_scan_state(
         market="US",
-        watchlist_key=_watchlist_cache_key("US"),
+        watchlist_key=_scan_candidate_key("US", scan_limit),
         min_score=min_score,
         scan_limit=scan_limit,
+        prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
     )
     kr_scan = get_today_scan_state(
         market="KR",
-        watchlist_key=_watchlist_cache_key("KR"),
+        watchlist_key=_scan_candidate_key("KR", scan_limit),
         min_score=min_score,
         scan_limit=scan_limit,
+        prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
     )
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
 
@@ -6334,35 +6488,60 @@ def render_buy_now_panel() -> None:
         st.info("오늘 조건을 만족한 종목이 없습니다.")
         return
 
-    top = combined.sort_values(by=["score", "ticker"], ascending=[False, True]).head(top_n).reset_index(drop=True)
-    best_row = top.iloc[0]
-    col1, col2, col3 = st.columns(3)
-    best_market = str(best_row.get("market", "") or "")
-    best_label = f"{best_market} {best_row['ticker']}".strip()
-    col1.metric("최상위 후보", best_label)
-    col2.metric("최고 판단", str(best_row["score_view"]))
-    col3.metric("후보 수", len(combined))
-    _render_action_deck(top.assign(bucket="오늘추천"), title="오늘 결정 카드", limit=4)
-    _show_table(
-        _prepare_recommendation_execution_view(top),
-        datetime_columns=["quote_as_of"],
-        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
-        column_config=_candidate_column_config(),
-    )
-    _render_manual_tracking_quick_add(top, source_label="오늘바로볼종목", key_prefix="buy_now_top")
+    def _render_market_buy_now(market_label: str, market_code: str, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            st.info(f"{market_label} 조건을 만족한 종목이 없습니다.")
+            return pd.DataFrame()
 
-    st.markdown("#### 급등 후보 보드")
-    momentum_board = combined.sort_values(
-        by=["volume_score", "breakout_score", "momentum_score", "score"],
-        ascending=[False, False, False, False],
-    ).head(top_n)
-    _show_table(
-        _prepare_recommendation_execution_view(momentum_board),
-        datetime_columns=["quote_as_of"],
-        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
-        column_config=_candidate_column_config(),
-    )
-    _render_manual_tracking_quick_add(momentum_board, source_label="급등후보보드", key_prefix="momentum_board")
+        market_top = frame.assign(market=market_code).sort_values(
+            by=["score", "ticker"], ascending=[False, True]
+        ).head(top_n).reset_index(drop=True)
+        best_row = market_top.iloc[0]
+        col1, col2, col3 = st.columns(3)
+        col1.metric(f"{market_label} 최상위 후보", str(best_row.get("ticker", "")))
+        col2.metric("판단 점수", str(best_row.get("score_view", best_row.get("score", ""))))
+        col3.metric("후보 수", len(frame))
+
+        _render_action_deck(market_top.assign(bucket="오늘추천"), title=f"{market_label} 결정 카드", limit=4)
+        _show_table(
+            _prepare_recommendation_execution_view(market_top, include_market=False, default_market=market_code),
+            datetime_columns=["quote_as_of"],
+            currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+            default_market=market_code,
+            column_config=_candidate_column_config(),
+        )
+        _render_manual_tracking_quick_add(
+            market_top,
+            source_label=f"{market_label} 오늘바로볼종목",
+            key_prefix=f"buy_now_{market_code.lower()}",
+            default_market=market_code,
+        )
+
+        st.markdown("#### 급등 후보 보드")
+        momentum_board = frame.assign(market=market_code).sort_values(
+            by=["volume_score", "breakout_score", "momentum_score", "score"],
+            ascending=[False, False, False, False],
+        ).head(top_n)
+        _show_table(
+            _prepare_recommendation_execution_view(momentum_board, include_market=False, default_market=market_code),
+            datetime_columns=["quote_as_of"],
+            currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+            default_market=market_code,
+            column_config=_candidate_column_config(),
+        )
+        _render_manual_tracking_quick_add(
+            momentum_board,
+            source_label=f"{market_label} 급등후보보드",
+            key_prefix=f"momentum_board_{market_code.lower()}",
+            default_market=market_code,
+        )
+        return market_top
+
+    us_tab, kr_tab = st.tabs(["미국", "한국"])
+    with us_tab:
+        us_top = _render_market_buy_now("미국", "US", us_scan)
+    with kr_tab:
+        kr_top = _render_market_buy_now("한국", "KR", kr_scan)
 
     if not st.session_state.portfolio.empty:
         portfolio_scores: list[int] = []
@@ -6387,17 +6566,32 @@ def render_buy_now_panel() -> None:
 
         if portfolio_scores:
             avg_score = sum(portfolio_scores) / len(portfolio_scores)
-            stronger = top[top["score"] > avg_score]
             st.markdown("#### 보유 종목보다 강한 후보")
-            if stronger.empty:
-                st.write("현재 보유 종목 평균 점수보다 확실히 강한 후보는 많지 않습니다.")
-            else:
-                _show_table(
-                    _prepare_recommendation_execution_view(stronger),
-                    datetime_columns=["quote_as_of"],
-                    currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
-                    column_config=_candidate_column_config(),
-                )
+            us_stronger = us_top[us_top["score"] > avg_score] if not us_top.empty else pd.DataFrame()
+            kr_stronger = kr_top[kr_top["score"] > avg_score] if not kr_top.empty else pd.DataFrame()
+            strong_us_tab, strong_kr_tab = st.tabs(["미국", "한국"])
+            with strong_us_tab:
+                if us_stronger.empty:
+                    st.write("미국 후보 중 보유 종목 평균 점수를 확실히 넘는 종목은 많지 않습니다.")
+                else:
+                    _show_table(
+                        _prepare_recommendation_execution_view(us_stronger, include_market=False, default_market="US"),
+                        datetime_columns=["quote_as_of"],
+                        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                        default_market="US",
+                        column_config=_candidate_column_config(),
+                    )
+            with strong_kr_tab:
+                if kr_stronger.empty:
+                    st.write("한국 후보 중 보유 종목 평균 점수를 확실히 넘는 종목은 많지 않습니다.")
+                else:
+                    _show_table(
+                        _prepare_recommendation_execution_view(kr_stronger, include_market=False, default_market="KR"),
+                        datetime_columns=["quote_as_of"],
+                        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
+                        default_market="KR",
+                        column_config=_candidate_column_config(),
+                    )
 
 
 def render_today_recommendation_page() -> None:
@@ -6405,7 +6599,7 @@ def render_today_recommendation_page() -> None:
     _render_recommendation_definition("today")
     st.caption("버튼을 눌러 오늘 후보를 계산합니다.")
 
-    if not _render_data_freshness_gate(purpose="오늘 추천", require_intraday=False):
+    if not _render_data_warning_or_gate(purpose="오늘 추천", require_intraday=False):
         st.info("최신 일봉 기준이 확인될 때까지 오늘 추천을 표시하지 않습니다.")
         return
 
@@ -6442,27 +6636,30 @@ def render_today_recommendation_page() -> None:
 def render_new_recommendation_hub() -> None:
     st.subheader("신규 추천")
     st.caption("추천 방향만 고르면 같은 추천 엔진과 예산 기준으로 종목, 진입가, 손절가, 분할매도를 봅니다.")
+    directions = ["오늘 추천", "단타", "장기 보유", "배당주", "예산 플랜"]
+    if st.session_state.get("recommendation_direction") not in directions:
+        st.session_state["recommendation_direction"] = "오늘 추천"
     direction = st.radio(
         "추천 방향",
-        ["오늘 당장", "단타", "장기 보유", "배당주", "예산으로 추천"],
+        directions,
         horizontal=True,
         label_visibility="collapsed",
         key="recommendation_direction",
     )
 
-    if direction == "오늘 당장":
+    if direction == "오늘 추천":
         _safe_render("오늘 추천", render_today_recommendation_page)
         with st.expander("실시간 급등주 스캐너 열기", expanded=False):
             _safe_render("실시간", render_realtime_tab)
     elif direction == "단타":
         _safe_render("단타", render_short_term_trade_tab)
     elif direction == "장기 보유":
-        if _render_data_freshness_gate(purpose="장기 보유 추천", require_intraday=False):
+        if _render_data_warning_or_gate(purpose="장기 보유 추천", require_intraday=False):
             _safe_render("장기/전략 추천", render_strategy_profiles_tab)
     elif direction == "배당주":
-        if _render_data_freshness_gate(purpose="배당주 추천", require_intraday=False):
+        if _render_data_warning_or_gate(purpose="배당주 추천", require_intraday=False):
             _safe_render("배당주", render_dividend_tab)
-    elif direction == "예산으로 추천":
+    elif direction == "예산 플랜":
         _safe_render("예산 플래너", render_budget_planner)
 
 
@@ -6597,7 +6794,7 @@ def render_realtime_tab() -> None:
     st.subheader("실시간 급등주 스캐너")
     st.caption("분봉 기준 급등/돌파/VWAP 확인.")
 
-    if not _render_data_freshness_gate(purpose="실시간 스캐너", require_intraday=True):
+    if not _render_data_warning_or_gate(purpose="실시간 스캐너", require_intraday=True):
         st.info("최신 분봉 기준이 확인될 때까지 실시간 추천을 표시하지 않습니다.")
         return
 
@@ -6706,6 +6903,7 @@ def render_realtime_tab() -> None:
                 column_config=_candidate_column_config(),
             )
             _render_manual_tracking_quick_add(us_scan, source_label="실시간", key_prefix="realtime_us", default_market="US")
+            _render_action_deck(us_scan.assign(market="US"), title="미국 실시간 결정 카드", limit=4)
 
     with kr_tab:
         st.caption(f"장세: {kr_regime.regime} / {kr_regime.note}")
@@ -6750,6 +6948,7 @@ def render_realtime_tab() -> None:
                 column_config=_candidate_column_config(),
             )
             _render_manual_tracking_quick_add(kr_scan, source_label="실시간", key_prefix="realtime_kr", default_market="KR")
+            _render_action_deck(kr_scan.assign(market="KR"), title="한국 실시간 결정 카드", limit=4)
 
     combined = pd.concat([us_scan.assign(market="US"), kr_scan.assign(market="KR")], ignore_index=True)
     if combined.empty:
@@ -6760,23 +6959,12 @@ def render_realtime_tab() -> None:
             remembered_markets.append(market_name)
     if remembered_markets:
         st.caption(f"학습 메모리 자동 저장: {', '.join(remembered_markets)} 실시간 추천")
-    _render_action_deck(combined.sort_values(by=["score", "ticker"], ascending=[False, True]), title="실시간 결정 카드", limit=4)
 
     if st.button("실시간 스냅샷 저장", width="stretch"):
         for market_name, frame in [("US", us_scan), ("KR", kr_scan)]:
             if not frame.empty:
                 append_scan_history("realtime_scan", market_name, frame)
         st.success("실시간 후보를 누적 저장했습니다.")
-
-    st.markdown("#### 실시간 탑픽")
-    top = combined.head(int(st.session_state.scanner_settings["top_n"]))
-    top_view = _prepare_recommendation_execution_view(top, include_market=True, include_source=False)
-    _show_table(
-        top_view,
-        datetime_columns=["quote_as_of"],
-        currency_columns=["current_price", "entry_price", "stop_loss", "target_1", "target_2", "target_3"],
-        column_config=_candidate_column_config(),
-    )
 
 
 def render_auto_candidates_tab() -> None:
@@ -6791,7 +6979,7 @@ def render_auto_candidates_tab() -> None:
             st.session_state["auto_candidates_ready"] = True
             st.rerun()
     with note_col:
-        st.caption("전체 계산은 버튼 실행. 30분 캐시.")
+        st.caption("전체 계산은 버튼 실행. 30분 동안 같은 결과를 재사용합니다.")
 
     if not st.session_state.get("auto_candidates_ready", False):
         history = load_recent_scan_history(limit=20)
@@ -7311,7 +7499,7 @@ def render_short_term_trade_tab() -> None:
     _render_recommendation_definition("trade")
     st.caption("단타/고위험 단타의 즉시 진입, 손절, 목표.")
 
-    if not _render_data_freshness_gate(purpose="단타 추천", require_intraday=True):
+    if not _render_data_warning_or_gate(purpose="단타 추천", require_intraday=True):
         st.info("최신 분봉 기준이 확인될 때까지 단타 추천을 표시하지 않습니다.")
         return
 
@@ -7327,7 +7515,7 @@ def render_short_term_trade_tab() -> None:
     )
     effective_sweep_limit = market_sweep_limit if deep_short_scan else min(market_sweep_limit, 24)
 
-    st.markdown("#### 단타 실행 모드 제안")
+    st.markdown("#### 단타 스캔 설정")
     _render_scan_advisor(purpose="short_term", key_prefix="short_term")
 
     run_col, hint_col = st.columns([1, 3])
@@ -7480,11 +7668,6 @@ def render_short_term_trade_tab() -> None:
                 remembered_markets.append(f"{market_name} {scan_type}")
         if remembered_markets:
             st.caption(f"학습 메모리 자동 저장: {', '.join(remembered_markets)}")
-        _render_action_deck(
-            combined.sort_values(by=["score", "ticker"], ascending=[False, True]).assign(bucket=combined.get("trade_group", "")),
-            title="단타 결정 카드",
-            limit=4,
-        )
         if st.button("단타 후보 스냅샷 저장", width="stretch"):
             for market_name, frame, scan_type in [
                 ("US", us_trades, "short_term_trade"),
@@ -7513,6 +7696,7 @@ def render_short_term_trade_tab() -> None:
                     column_config=_trade_column_config(),
                 )
                 _render_manual_tracking_quick_add(us_trades, source_label="일반단타", key_prefix="short_trade_us", default_market="US")
+                _render_action_deck(us_trades.assign(market="US", bucket="일반단타"), title="미국 일반 단타 결정 카드", limit=4)
         with risky_tab:
             if us_high_risk.empty:
                 st.info("미국 고위험 단타 후보가 없습니다.")
@@ -7527,6 +7711,7 @@ def render_short_term_trade_tab() -> None:
                     column_config=_trade_column_config(),
                 )
                 _render_manual_tracking_quick_add(us_high_risk, source_label="고위험단타", key_prefix="high_risk_us", default_market="US")
+                _render_action_deck(us_high_risk.assign(market="US", bucket="고위험단타"), title="미국 고위험 단타 결정 카드", limit=4)
     with kr_tab:
         st.caption(f"장세: {kr_regime.regime} / {kr_regime.note}")
         normal_tab, risky_tab = st.tabs(["일반 단타", "고위험 단타"])
@@ -7543,6 +7728,7 @@ def render_short_term_trade_tab() -> None:
                     column_config=_trade_column_config(),
                 )
                 _render_manual_tracking_quick_add(kr_trades, source_label="일반단타", key_prefix="short_trade_kr", default_market="KR")
+                _render_action_deck(kr_trades.assign(market="KR", bucket="일반단타"), title="한국 일반 단타 결정 카드", limit=4)
         with risky_tab:
             if kr_high_risk.empty:
                 st.info("한국 고위험 단타 후보가 없습니다.")
@@ -7557,6 +7743,7 @@ def render_short_term_trade_tab() -> None:
                     column_config=_trade_column_config(),
                 )
                 _render_manual_tracking_quick_add(kr_high_risk, source_label="고위험단타", key_prefix="high_risk_kr", default_market="KR")
+                _render_action_deck(kr_high_risk.assign(market="KR", bucket="고위험단타"), title="한국 고위험 단타 결정 카드", limit=4)
 
     if not combined.empty:
         st.markdown("#### 단타 운용 원칙")
@@ -7886,14 +8073,14 @@ def render_daily_dashboard() -> None:
     for col, ready in zip(ready_cols, [_daily_cache_readiness("US", readiness_limit), _daily_cache_readiness("KR", readiness_limit)]):
         with col:
             st.metric(
-                f"{ready['market']} 탐색 캐시",
+                f"{ready['market']} 탐색 데이터",
                 f"{float(ready['coverage_pct']):.0f}%",
                 f"{ready['label']}",
             )
             st.progress(min(1.0, max(0.0, float(ready["coverage_pct"]) / 100)))
             st.caption(
                 f"사용 가능 {int(ready['usable']):,}/{int(ready['total']):,}개 · "
-                f"신선 {int(ready['fresh']):,} / 만료 {int(ready['stale']):,} / 없음 {int(ready['missing']):,}. "
+                f"최신 {int(ready['fresh']):,} / 오래됨 {int(ready['stale']):,} / 미수집 {int(ready['missing']):,}. "
                 f"{ready['action']}"
             )
 
@@ -7987,9 +8174,10 @@ def render_daily_dashboard() -> None:
             for market in ["US", "KR"]:
                 scan = get_today_scan_state(
                     market=market,
-                    watchlist_key=_watchlist_cache_key(market),
+                    watchlist_key=_scan_candidate_key(market, scan_limit),
                     min_score=min_score,
                     scan_limit=scan_limit,
+                    prefer_warehouse=bool(st.session_state.get("prefer_price_warehouse", True)),
                 )
                 if not scan.empty:
                     frames.append(scan.assign(market=market, scan_type="today_scan", data_basis="오늘 새 스캔"))

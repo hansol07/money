@@ -13,13 +13,19 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "data"
 CACHE_DB_FILE = DATA_DIR / "cache.sqlite3"
+_SCHEMA_READY = False
 
 
 def _connect() -> sqlite3.Connection:
+    global _SCHEMA_READY
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(CACHE_DB_FILE, timeout=10)
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    if _SCHEMA_READY:
+        return conn
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS cache_entries (
@@ -79,6 +85,9 @@ def _connect() -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_price_bars_ticker_interval_ts ON price_bars(ticker, interval, ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_price_bars_market_interval_ts ON price_bars(market, interval, ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_bars_interval_ticker_ts ON price_bars(interval, ticker, ts DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_bars_market_interval_ticker_ts ON price_bars(market, interval, ticker, ts DESC)")
+    _SCHEMA_READY = True
     return conn
 
 
@@ -298,6 +307,51 @@ def get_price_bars(ticker: str, interval: str, *, limit: int | None = None) -> p
     return frame
 
 
+def get_price_bars_for_tickers(tickers: list[str], interval: str, *, bars_per_ticker: int = 260) -> pd.DataFrame:
+    cleaned = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        symbol = str(ticker or "").strip().upper()
+        if symbol and symbol not in seen:
+            cleaned.append(symbol)
+            seen.add(symbol)
+    if not cleaned:
+        return pd.DataFrame()
+    interval = str(interval or "").strip()
+    if not interval:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    try:
+        with _connect() as conn:
+            for start in range(0, len(cleaned), 300):
+                chunk = cleaned[start : start + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT ticker, ts, open, high, low, close, volume
+                    FROM (
+                        SELECT ticker, ts, open, high, low, close, volume,
+                               ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY ts DESC) AS rn
+                        FROM price_bars
+                        WHERE interval = ? AND ticker IN ({placeholders})
+                    )
+                    WHERE rn <= ?
+                    ORDER BY ticker, ts
+                    """,
+                    (interval, *chunk, max(1, int(bars_per_ticker))),
+                ).fetchall()
+                if rows:
+                    frames.append(pd.DataFrame(rows, columns=["ticker", "Date", "Open", "High", "Low", "Close", "Volume"]))
+    except Exception:
+        return pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    frame = pd.concat(frames, ignore_index=True)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    return frame.dropna(subset=["Date", "Close"]).sort_values(["ticker", "Date"]).reset_index(drop=True)
+
+
 def get_price_warehouse_stats() -> pd.DataFrame:
     try:
         with _connect() as conn:
@@ -313,6 +367,33 @@ def get_price_warehouse_stats() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=["market", "interval", "bars", "tickers", "first_ts", "last_ts"])
+
+
+def get_price_warehouse_tickers(market: str | None = None, *, interval: str | None = None) -> pd.DataFrame:
+    where: list[str] = []
+    params: list[object] = []
+    if market:
+        where.append("market = ?")
+        params.append(str(market).upper())
+    if interval:
+        where.append("interval = ?")
+        params.append(str(interval))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT market, ticker, COUNT(*) AS bars, MIN(ts) AS first_ts, MAX(ts) AS last_ts
+                FROM price_bars
+                {where_sql}
+                GROUP BY market, ticker
+                ORDER BY MAX(ts) DESC, COUNT(*) DESC, ticker
+                """,
+                tuple(params),
+            ).fetchall()
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=["market", "ticker", "bars", "first_ts", "last_ts"])
 
 
 def get_cache_key_status(cache_keys: list[str]) -> dict[str, int]:

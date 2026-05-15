@@ -14,8 +14,10 @@ from src.data.fetch import (
     price_source_label,
 )
 from src.portfolio.models import PositionInput
+from src.indicators.technical import add_indicators
+from src.storage.sqlite_cache import get_price_bars_for_tickers
 from src.strategy.learning import apply_context_adjustment, apply_learning_adjustment, ContextAdjustment, LearningAdjustment
-from src.strategy.regime import classify_market_regime
+from src.strategy.regime import classify_market_regime, MarketRegime
 from src.strategy.recommendation import RecommendationResult, analyze_position
 from src.strategy.universe import get_universe
 
@@ -28,6 +30,28 @@ class CandidateProfile:
     breakout_score: int
     setup: str
     reasons: list[str]
+
+
+def _score_from_indicators(data: pd.DataFrame) -> tuple[int, CandidateProfile]:
+    profile = _build_candidate_profile(data)
+    latest = data.iloc[-1]
+    base = 42
+    if latest["Close"] > latest["ma20"]:
+        base += 10
+    if latest["Close"] > latest["ma60"]:
+        base += 8
+    if 42 <= latest["rsi"] <= 72:
+        base += 8
+    if latest["macd_diff"] > 0:
+        base += 7
+    if latest["volume_ratio"] >= 1.1:
+        base += 8
+    if latest["return_20d"] >= 4:
+        base += 8
+    if latest["rs_score"] >= 8:
+        base += 6
+    score = int(max(0, min(100, base + profile.trend_score + profile.momentum_score + profile.volume_score + profile.breakout_score)))
+    return score, profile
 
 
 def _build_candidate_profile(data: pd.DataFrame) -> CandidateProfile:
@@ -105,6 +129,91 @@ def _build_trade_plan(data: pd.DataFrame) -> tuple[float, float, float]:
     return round(entry_price, 2), round(stop_loss, 2), round(target_1, 2)
 
 
+def scan_market_fast_db(
+    market: str,
+    universe: list[dict[str, str]],
+    min_score: int = 60,
+) -> pd.DataFrame:
+    tickers = [str(item.get("ticker", "")).strip().upper() for item in universe]
+    names = {str(item.get("ticker", "")).strip().upper(): str(item.get("name", "") or "") for item in universe}
+    bars = get_price_bars_for_tickers(tickers, "1d", bars_per_ticker=280)
+    if bars.empty:
+        return scan_market(market, universe, min_score=min_score, include_context=False, include_learning=False)
+
+    rows: list[dict[str, object]] = []
+    regime = MarketRegime(
+        market=market,
+        benchmark="DB",
+        regime="저장DB",
+        adjustment=0,
+        note="시장 장세는 온라인 조회 없이 저장 DB 후보만 빠르게 봅니다.",
+        trend_strength=0.0,
+    )
+    for ticker, group in bars.groupby("ticker", sort=False):
+        try:
+            data = add_indicators(group.drop(columns=["ticker"]).reset_index(drop=True))
+            if data.empty or len(data) < 20:
+                continue
+            latest_ts = latest_price_timestamp(data)
+            if latest_ts is None:
+                continue
+            data_is_fresh = is_recent_price_data(data, max_age_days=3)
+            score, profile = _score_from_indicators(data)
+            if not data_is_fresh:
+                score -= 8
+            score = int(max(0, min(100, score + regime.adjustment)))
+            if score < min_score:
+                continue
+            latest = data.iloc[-1]
+            entry_price, stop_loss, target_1 = _build_trade_plan(data)
+            stale_note = ["최신 갱신 실패: 저장 DB 기준 참고용"] if not data_is_fresh else []
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "name": names.get(ticker, ""),
+                    "action": "오늘매수후보" if score >= 80 else "관심후보" if score >= 68 else "보류",
+                    "setup": profile.setup,
+                    "score": score,
+                    "current_price": round(float(latest["Close"]), 2),
+                    "trend_score": profile.trend_score,
+                    "momentum_score": profile.momentum_score,
+                    "volume_score": profile.volume_score,
+                    "breakout_score": profile.breakout_score,
+                    "volume_ratio": round(float(latest["volume_ratio"]), 2),
+                    "return_20d": round(float(latest["return_20d"]), 2),
+                    "rs_score": round(float(latest["rs_score"]), 2),
+                    "atr_pct": round(float(latest["atr_pct"]), 2),
+                    "from_52w_high_pct": round(float(latest["from_52w_high_pct"]), 2),
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "target_1": target_1,
+                    "quote_as_of": latest_ts.strftime("%Y-%m-%d") if latest_ts is not None else "",
+                    "data_freshness": price_data_freshness_label(data, intraday=False) if data_is_fresh else "오래된 기준",
+                    "price_source": "1d-db" if data_is_fresh else "1d-db(오래됨)",
+                    "regime": regime.regime,
+                    "regime_delta": regime.adjustment,
+                    "context_delta": 0,
+                    "event_risk": "",
+                    "event_note": "",
+                    "earnings_date": "",
+                    "ex_dividend_date": "",
+                    "news_bias": "미반영",
+                    "news_score": 0,
+                    "news_count": 0,
+                    "learning_delta": 0,
+                    "reason": " / ".join(stale_note + ([regime.note] if regime.note else []) + profile.reasons[:4]),
+                }
+            )
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        by=["score", "volume_ratio", "return_20d"], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+
 def analyze_candidate(ticker: str) -> RecommendationResult | None:
     data = get_stock_data(ticker)
     if data.empty:
@@ -143,6 +252,8 @@ def scan_market(
     learning_adjustments: dict[tuple[str, str, str], LearningAdjustment] | None = None,
     event_adjustments: dict[str, ContextAdjustment] | None = None,
     news_adjustments: dict[str, ContextAdjustment] | None = None,
+    include_context: bool = True,
+    include_learning: bool = True,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     regime = classify_market_regime(market)
@@ -165,8 +276,8 @@ def scan_market(
             )
             profile = _build_candidate_profile(data)
             bonus = profile.trend_score + profile.momentum_score + profile.volume_score + profile.breakout_score
-            event_summary = get_stock_event_summary(item["ticker"])
-            news_summary = get_stock_news_summary(item["ticker"])
+            event_summary = get_stock_event_summary(item["ticker"]) if include_context else {}
+            news_summary = get_stock_news_summary(item["ticker"]) if include_context else {}
             event_risk = str(event_summary.get("event_risk", "") or "")
             news_bias = str(news_summary.get("news_bias", "중립") or "중립")
             news_score = int(news_summary.get("news_score", 0) or 0)
@@ -185,20 +296,26 @@ def scan_market(
                 event_reasons.append("최근 뉴스 흐름이 다소 부담스럽습니다.")
 
             base_score = max(0, min(100, analyzed.score + bonus + regime.adjustment + event_delta))
-            adjusted_score, learning_delta, learning_note = apply_learning_adjustment(
-                base_score=base_score,
-                scan_type="today_scan",
-                market=market,
-                setup=profile.setup,
-                adjustments=learning_adjustments,
-            )
-            adjusted_score, context_delta, context_note = apply_context_adjustment(
-                base_score=adjusted_score,
-                event_risk=event_risk,
-                news_bias=news_bias,
-                event_adjustments=event_adjustments,
-                news_adjustments=news_adjustments,
-            )
+            if include_learning:
+                adjusted_score, learning_delta, learning_note = apply_learning_adjustment(
+                    base_score=base_score,
+                    scan_type="today_scan",
+                    market=market,
+                    setup=profile.setup,
+                    adjustments=learning_adjustments,
+                )
+            else:
+                adjusted_score, learning_delta, learning_note = base_score, 0, ""
+            if include_context:
+                adjusted_score, context_delta, context_note = apply_context_adjustment(
+                    base_score=adjusted_score,
+                    event_risk=event_risk,
+                    news_bias=news_bias,
+                    event_adjustments=event_adjustments,
+                    news_adjustments=news_adjustments,
+                )
+            else:
+                context_delta, context_note = 0, ""
             analyzed.score = adjusted_score
 
             if analyzed.score < min_score:
